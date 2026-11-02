@@ -1,0 +1,35 @@
+[package]
+name = "rxctools"
+version = "0.1.0"
+edition = "2024"
+description = "Xcode's iPhone tools without Xcode: devicectl, xcodebuild test-without-building, devmodectl and app signing on macOS and Linux"
+license = "MIT"
+repository = "https://github.com/kmagiera/rxctools"
+keywords = ["ios", "iphone", "xcode", "devicectl", "usbmuxd"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+aes = "0.9.3"
+cbc = "0.2.1"
+crc32fast = "1.5.3"
+des = "0.9.0"
+mio = { version = "1.2.4", features = ["os-poll", "net"] }
+plist = "1.10.3"
+rc2 = "0.9.0"
+ring = "0.17.14"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+serde_json = "1.0.154"
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv6", "socket-tcp"] }
+uuid = { version = "1.29.0", features = ["v4"] }
+webpki-roots = "1.0.11"
+zip = { version = "9.2.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[[bin]]
+name = "rxc"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
