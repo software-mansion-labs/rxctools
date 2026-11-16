@@ -344,7 +344,10 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
         "devicectl device info apps" => apps(a)?,
         "devicectl device info processes" => {
             let t = open_tunnel(a)?;
-            let list = instruments::process_list(&*instruments::connect(&t)?)?;
+            let list: Vec<J> = xctest::list_processes(&t)?
+                .into_iter()
+                .map(|(pid, url)| json!({"processIdentifier": pid, "executable": url}))
+                .collect();
             table(
                 &["PID", "Executable"],
                 list.iter()
@@ -367,9 +370,11 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
         }
         "devicectl device process launch" => launch(a, arg("bundle-identifier")?, &rest[1..])?,
         "devicectl device process terminate" => {
-            let pid: u64 = a
+            // a pid that is not positive would signal a process group, or every process
+            let pid: i32 = a
                 .opt("--pid")
                 .and_then(|p| p.parse().ok())
+                .filter(|p| *p > 0)
                 .ok_or_else(|| Error::msg("--pid <pid> is required"))?;
             let t = open_tunnel(a)?;
             let (name, sig) = if a.flag("--kill") {
@@ -377,7 +382,7 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
             } else {
                 ("SIGTERM", 15)
             };
-            instruments::signal(&*instruments::connect(&t)?, pid, sig)?;
+            xctest::signal_process(&t, pid.into(), sig)?;
             say(format!("Sent {name} to process {pid}."));
             json!({"deviceIdentifier": t.udid, "process": {"processIdentifier": pid}})
         }

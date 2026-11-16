@@ -50,6 +50,7 @@ impl NS {
                 .collect(),
         }
     }
+    #[cfg(test)]
     pub fn get(&self, key: &str) -> Option<&NS> {
         match self {
             NS::Dict(d) => d
@@ -63,13 +64,6 @@ impl NS {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             NS::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-    pub fn as_u64(&self) -> Option<u64> {
-        match self {
-            NS::UInt(u) => Some(*u),
-            NS::Int(i) if *i >= 0 => Some(*i as u64),
             _ => None,
         }
     }

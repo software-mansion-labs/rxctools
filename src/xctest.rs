@@ -385,7 +385,6 @@ pub struct Launch<'a> {
 
 /// CoreDevice appservice: launch an app with arguments, environment and stdio, returns the pid.
 pub fn launch_app(t: &Tunnel, bundle: &str, l: &Launch) -> Result<i64> {
-    let mut c = XpcConn::connect(t.connect_service(APPSERVICE)?)?;
     let mut platform_opts = vec![];
     plist::to_writer_binary(&mut platform_opts, l.platform_opts)?;
     let stdio_ids = match l.stdio {
@@ -431,28 +430,11 @@ pub fn launch_app(t: &Tunnel, bundle: &str, l: &Launch) -> Result<i64> {
         ("options", xdict(options)),
         ("standardIOIdentifiers", stdio_ids),
     ]);
-    let device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
-    c.send(
-        xpc::coredevice_request(
-            &device_id,
-            "com.apple.coredevice.feature.launchapplication",
-            input,
-        ),
-        xpc::HEARTBEAT_REQUEST,
-    )?;
-    let m = c.recv_body(xpc::SERVER_CLIENT)?;
-    if let Some(e) = m.get("CoreDevice.error") {
-        return bail(format!("launch {bundle} failed: {e:?}"));
-    }
-    m.get("CoreDevice.output")
-        .and_then(|o| o.get("processToken"))
+    appservice(t, "com.apple.coredevice.feature.launchapplication", input)?
+        .get("processToken")
         .and_then(|p| p.get("processIdentifier"))
         .and_then(|p| p.as_i64())
-        .ok_or_else(|| {
-            Error::msg(format!(
-                "pidFromResponse: could not get pid from response {m:?}"
-            ))
-        })
+        .ok_or_else(|| Error::msg(format!("launch {bundle}: no pid in the reply")))
 }
 
 pub fn run(
@@ -723,7 +705,7 @@ pub fn run(
         );
     }
     // take the runner down with the session
-    let _ = kill_process(t, pid);
+    let _ = signal_process(t, pid, 9);
     let failed = failures.load(Ordering::SeqCst);
     if !reason.is_empty() {
         bail(reason)
@@ -742,23 +724,66 @@ fn test_failed(selector: &str, m: &Msg) -> bool {
             .any(|a| matches!(a, Some(NS::Str(s)) if s == "failure" || s == "failed"))
 }
 
-fn kill_process(t: &Tunnel, pid: i64) -> Result<()> {
+/// A CoreDevice appservice feature; its output, or the device's error.
+fn appservice(t: &Tunnel, feature: &str, input: X) -> Result<X> {
     let mut c = XpcConn::connect(t.connect_service(APPSERVICE)?)?;
     let device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
-    let input = xdict(vec![
-        ("process", xdict(vec![("processIdentifier", X::I64(pid))])),
-        ("signal", X::I64(9)),
-    ]);
     c.send(
-        xpc::coredevice_request(
-            &device_id,
-            "com.apple.coredevice.feature.sendsignaltoprocess",
-            input,
-        ),
+        xpc::coredevice_request(&device_id, feature, input),
         xpc::HEARTBEAT_REQUEST,
     )?;
-    c.recv_body(xpc::SERVER_CLIENT)?;
-    Ok(())
+    let mut m = c.recv_body(xpc::SERVER_CLIENT)?;
+    if let Some(e) = m.get("CoreDevice.error") {
+        let info = |k| e.get("userInfo")?.get(k)?.as_str();
+        return bail(
+            match (
+                info("NSLocalizedDescription"),
+                info("NSLocalizedFailureReason"),
+            ) {
+                (Some(d), Some(r)) => format!("{d} {r}"),
+                (Some(d), None) => d.into(),
+                _ => format!("{feature} failed: {e:?}"),
+            },
+        );
+    }
+    match &mut m {
+        X::Dict(d) => Ok(d.remove("CoreDevice.output").unwrap_or(X::Null)),
+        _ => bail(format!("{feature}: unexpected reply {m:?}")),
+    }
+}
+
+/// Running processes as (pid, executable URL). Runs outside DTServiceHub, so that one is listed too.
+pub fn list_processes(t: &Tunnel) -> Result<Vec<(i64, Option<String>)>> {
+    let out = appservice(
+        t,
+        "com.apple.coredevice.feature.listprocesses",
+        xdict(vec![]),
+    )?;
+    process_tokens(&out)
+}
+
+fn process_tokens(out: &X) -> Result<Vec<(i64, Option<String>)>> {
+    let Some(X::Array(list)) = out.get("processTokens") else {
+        return bail(format!("listprocesses: unexpected output {out:?}"));
+    };
+    Ok(list
+        .iter()
+        .filter_map(|p| {
+            let url = p.get("executableURL").and_then(|u| u.get("relative"));
+            Some((
+                p.get("processIdentifier")?.as_i64()?,
+                url.and_then(|u| u.as_str()).map(Into::into),
+            ))
+        })
+        .collect())
+}
+
+pub fn signal_process(t: &Tunnel, pid: i64, signal: i64) -> Result<()> {
+    let input = xdict(vec![
+        ("process", xdict(vec![("processIdentifier", X::I64(pid))])),
+        ("signal", X::I64(signal)),
+    ]);
+    appservice(t, "com.apple.coredevice.feature.sendsignaltoprocess", input).map(|_| ())
 }
 
 #[cfg(test)]
@@ -911,5 +936,25 @@ mod tests {
             matches!(back.get("testBundleURL"), Some(NS::Url { relative, .. }) if relative.ends_with("R.app/PlugIns/RunnerUITests.xctest"))
         );
         assert!(matches!(back.get("testsToRun"), Some(NS::Set(s)) if s.len() == 2));
+    }
+
+    #[test]
+    fn process_tokens_keep_pid_and_executable() {
+        let p = |pid, url: Option<&str>| {
+            let mut t = vec![("processIdentifier", X::I64(pid))];
+            if let Some(u) = url {
+                t.push(("executableURL", xdict(vec![("relative", u.into())])));
+            }
+            xdict(t)
+        };
+        let out = xdict(vec![(
+            "processTokens",
+            X::Array(vec![p(895, Some("file:///DTServiceHub")), p(0, None)]),
+        )]);
+        assert_eq!(
+            process_tokens(&out).unwrap(),
+            [(895, Some("file:///DTServiceHub".into())), (0, None)]
+        );
+        assert!(process_tokens(&xdict(vec![])).is_err());
     }
 }
