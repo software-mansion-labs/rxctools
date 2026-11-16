@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2024"
 description = "Xcode's iPhone tools without Xcode: devicectl, xcodebuild test-without-building, devmodectl and app signing on macOS and Linux"
 license = "MIT"
-repository = "https://github.com/kmagiera/rxctools"
+repository = "https://github.com/software-mansion-labs/rxctools"
 keywords = ["ios", "iphone", "xcode", "devicectl", "usbmuxd"]
 categories = ["command-line-utilities", "development-tools"]
 
