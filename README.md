@@ -21,7 +21,7 @@ rxc devicectl device process launch --device <udid> com.apple.Preferences     # 
 
 | Xcode tool | rxctools | Covers |
 |---|---|---|
-| `xcrun devicectl` | `rxc devicectl` | `list devices`; `device info details`, `apps`, `processes`, `ddiServices`; `device install app`, `device uninstall app`; `device process launch`, `terminate`; `device capture screenshot`; `manage ddis update` |
+| `xcrun devicectl` | `rxc devicectl` | `list devices`; `device info details`, `apps`, `processes`, `ddiServices`; `device install app`, `device uninstall app`; `device process launch`, `terminate`; `device capture screenshot`; `device reboot`; `device simulate location coordinate`, `clear`; `manage ddis update` |
 | `xcodebuild` | `rxc xcodebuild` | `test-without-building` for iOS 17+ |
 | `devmodectl` | `rxc devmodectl` | `single` |
 | none, Xcode keeps its tunnels to itself | `rxc tunnel` | `run`, `list` |
@@ -64,7 +64,8 @@ with their SHA-256 in `SHA256SUMS`.
 | `rxc devicectl device install app <.app or .ipa>`, `device uninstall app <bundle-id>` | |
 | `rxc devicectl device info ddiServices [--no-auto-mount-ddis]` | mounts the iOS 17+ personalized developer disk image, signed for the device by Apple's TSS. With Developer Mode off it shows the toggle in Settings, as Xcode does |
 | `rxc devicectl manage ddis update` | only downloads that image, into `~/.cache/rxc/ddis` |
-| `rxc devicectl device info processes`, `device process launch [--terminate-existing] [--environment-variables <json>] [--payload-url <url>] <bundle-id> [<arguments> ...]`, `device process terminate --pid <pid> [--kill]`, `device capture screenshot --destination <png>` | need `rxc tunnel run` |
+| `rxc devicectl device reboot` | full reboot through lockdown, no tunnel needed |
+| `rxc devicectl device info processes`, `device process launch [--terminate-existing] [--environment-variables <json>] [--payload-url <url>] <bundle-id> [<arguments> ...]`, `device process terminate --pid <pid> [--kill]`, `device capture screenshot --destination <png>`, `device simulate location coordinate --latitude <degrees> --longitude <degrees>`, `device simulate location clear` | need `rxc tunnel run` |
 | `rxc xcodebuild test-without-building -xctestrun <file> -destination id=<udid>` | needs `rxc tunnel run`; the runner's output goes to stdout |
 | `rxc devmodectl single <udid>` | turns Developer Mode on, waits for the restart and confirms it |
 | `rxc tunnel run`, `rxc tunnel list` | holds the iOS 17+ tunnel open in user space, without root, and tells the commands above where to find it on `--tunnel` (default `127.0.0.1:50550`) |
@@ -76,8 +77,9 @@ Common options are devicectl's: `--device`/`-d` (the first device when left out)
 like devicectl's. Human-readable output goes to stdout, or to stderr when the JSON does.
 
 Not implemented yet: devicectl's other commands (file copy, profiles, other settings, openURL,
-screen recording, reboot, sysdiagnose), devmodectl's `info`, `list` and `streaming`, syslog, crash
-reports, pairing, and anything below iOS 17 that needs the developer disk image or the tunnel.
+screen recording, sysdiagnose, location routes and scenarios), devmodectl's `info`, `list` and
+`streaming`, syslog, crash reports, pairing, and anything below iOS 17 that needs the developer
+disk image or the tunnel.
 
 ## Speed
 

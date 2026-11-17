@@ -503,9 +503,13 @@ pub fn service_port(services: &BTreeMap<String, u16>, name: &str) -> Option<u16>
         .copied()
 }
 
-pub fn coredevice_request(device_id: &str, feature: &str, input: X) -> X {
-    xdict(vec![
-        ("CoreDevice.CoreDeviceDDIProtocolVersion", X::I64(0)),
+/// A CoreDevice invocation; features that offer several actions also take the action's identifier.
+pub fn coredevice_request(device_id: &str, feature: &str, action: Option<&str>, input: X) -> X {
+    let mut req = xdict(vec![
+        (
+            "CoreDevice.CoreDeviceDDIProtocolVersion",
+            X::I64(if action.is_some() { 2 } else { 0 }),
+        ),
         ("CoreDevice.action", xdict(vec![])),
         (
             "CoreDevice.coreDeviceVersion",
@@ -531,7 +535,11 @@ pub fn coredevice_request(device_id: &str, feature: &str, input: X) -> X {
             "CoreDevice.invocationIdentifier",
             uuid::Uuid::new_v4().to_string().to_uppercase().into(),
         ),
-    ])
+    ]);
+    if let (Some(a), X::Dict(d)) = (action, &mut req) {
+        d.insert("CoreDevice.actionIdentifier".into(), a.into());
+    }
+    req
 }
 
 #[cfg(test)]
@@ -724,5 +732,30 @@ mod tests {
         let n = m.len();
         m.truncate(n - 3);
         assert!(decode_message(&mut &m[..]).is_err());
+    }
+
+    #[test]
+    fn coredevice_actions_need_protocol_2() {
+        let f = "com.apple.coredevice.feature.simulatelocation";
+        let a = "com.apple.coredevice.action.clearsimulatedlocation";
+        let with = coredevice_request("D", f, Some(a), xdict(vec![]));
+        assert_eq!(
+            with.get("CoreDevice.actionIdentifier")
+                .and_then(|v| v.as_str()),
+            Some(a)
+        );
+        assert_eq!(
+            with.get("CoreDevice.CoreDeviceDDIProtocolVersion")
+                .and_then(|v| v.as_i64()),
+            Some(2)
+        );
+        let without = coredevice_request("D", f, None, xdict(vec![]));
+        assert!(without.get("CoreDevice.actionIdentifier").is_none());
+        assert_eq!(
+            without
+                .get("CoreDevice.CoreDeviceDDIProtocolVersion")
+                .and_then(|v| v.as_i64()),
+            Some(0)
+        );
     }
 }

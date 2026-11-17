@@ -430,11 +430,17 @@ pub fn launch_app(t: &Tunnel, bundle: &str, l: &Launch) -> Result<i64> {
         ("options", xdict(options)),
         ("standardIOIdentifiers", stdio_ids),
     ]);
-    appservice(t, "com.apple.coredevice.feature.launchapplication", input)?
-        .get("processToken")
-        .and_then(|p| p.get("processIdentifier"))
-        .and_then(|p| p.as_i64())
-        .ok_or_else(|| Error::msg(format!("launch {bundle}: no pid in the reply")))
+    coredevice(
+        t,
+        APPSERVICE,
+        "com.apple.coredevice.feature.launchapplication",
+        None,
+        input,
+    )?
+    .get("processToken")
+    .and_then(|p| p.get("processIdentifier"))
+    .and_then(|p| p.as_i64())
+    .ok_or_else(|| Error::msg(format!("launch {bundle}: no pid in the reply")))
 }
 
 pub fn run(
@@ -724,12 +730,18 @@ fn test_failed(selector: &str, m: &Msg) -> bool {
             .any(|a| matches!(a, Some(NS::Str(s)) if s == "failure" || s == "failed"))
 }
 
-/// A CoreDevice appservice feature; its output, or the device's error.
-fn appservice(t: &Tunnel, feature: &str, input: X) -> Result<X> {
-    let mut c = XpcConn::connect(t.connect_service(APPSERVICE)?)?;
+/// A CoreDevice feature of `service`; its output, or the device's error.
+fn coredevice(
+    t: &Tunnel,
+    service: &str,
+    feature: &str,
+    action: Option<&str>,
+    input: X,
+) -> Result<X> {
+    let mut c = XpcConn::connect(t.connect_service(service)?)?;
     let device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
     c.send(
-        xpc::coredevice_request(&device_id, feature, input),
+        xpc::coredevice_request(&device_id, feature, action, input),
         xpc::HEARTBEAT_REQUEST,
     )?;
     let mut m = c.recv_body(xpc::SERVER_CLIENT)?;
@@ -754,9 +766,11 @@ fn appservice(t: &Tunnel, feature: &str, input: X) -> Result<X> {
 
 /// Running processes as (pid, executable URL). Runs outside DTServiceHub, so that one is listed too.
 pub fn list_processes(t: &Tunnel) -> Result<Vec<(i64, Option<String>)>> {
-    let out = appservice(
+    let out = coredevice(
         t,
+        APPSERVICE,
         "com.apple.coredevice.feature.listprocesses",
+        None,
         xdict(vec![]),
     )?;
     process_tokens(&out)
@@ -778,12 +792,41 @@ fn process_tokens(out: &X) -> Result<Vec<(i64, Option<String>)>> {
         .collect())
 }
 
+/// `devicectl device simulate location`: these coordinates until cleared, or None to clear.
+pub fn simulate_location(t: &Tunnel, at: Option<(f64, f64)>) -> Result<()> {
+    let (action, input) = match at {
+        Some((lat, lon)) => (
+            "com.apple.coredevice.action.setsimulatedlocation",
+            xdict(vec![("latitude", X::F64(lat)), ("longitude", X::F64(lon))]),
+        ),
+        None => (
+            "com.apple.coredevice.action.clearsimulatedlocation",
+            xdict(vec![]),
+        ),
+    };
+    coredevice(
+        t,
+        "com.apple.coredevice.locationservice",
+        "com.apple.coredevice.feature.simulatelocation",
+        Some(action),
+        input,
+    )
+    .map(|_| ())
+}
+
 pub fn signal_process(t: &Tunnel, pid: i64, signal: i64) -> Result<()> {
     let input = xdict(vec![
         ("process", xdict(vec![("processIdentifier", X::I64(pid))])),
         ("signal", X::I64(signal)),
     ]);
-    appservice(t, "com.apple.coredevice.feature.sendsignaltoprocess", input).map(|_| ())
+    coredevice(
+        t,
+        APPSERVICE,
+        "com.apple.coredevice.feature.sendsignaltoprocess",
+        None,
+        input,
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

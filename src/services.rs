@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub const INSTALLATION_PROXY: &str = "com.apple.mobile.installation_proxy";
 pub const ZIP_CONDUIT: &str = "com.apple.streaming_zip_conduit";
 pub const AMFI: &str = "com.apple.amfi.lockdown";
+pub const DIAGNOSTICS: &str = "com.apple.mobile.diagnostics_relay";
 
 /// AMFI developer mode actions: 0 reveals the toggle in Settings, 1 turns developer mode on (the
 /// device restarts; refused while a passcode is set), 2 confirms it after the restart.
@@ -27,6 +28,22 @@ pub fn amfi(s: &mut (impl Read + Write), action: u64) -> Result<()> {
         return Ok(());
     }
     bail("no error or success was reported")
+}
+
+/// Asks the device to restart once this connection closes.
+pub fn restart(s: &mut (impl Read + Write)) -> Result<()> {
+    write_plist(
+        s,
+        &dict(&[
+            ("Request", "Restart".into()),
+            ("WaitForDisconnect", true.into()),
+        ]),
+    )?;
+    let r = read_plist(s)?;
+    match r.get("Status").and_then(|v| v.as_string()) {
+        Some("Success") => Ok(()),
+        _ => bail(format!("restart was refused: {r:?}")),
+    }
 }
 
 pub fn browse_request(app_type: &str, show_launch_prohibited: bool) -> Dictionary {

@@ -60,6 +60,15 @@ const COMMANDS: &[(&str, &str)] = &[
         "devicectl device capture screenshot",
         "--device <udid> --destination <path>",
     ),
+    ("devicectl device reboot", "--device <udid>"),
+    (
+        "devicectl device simulate location coordinate",
+        "--device <udid> --latitude <degrees> --longitude <degrees>",
+    ),
+    (
+        "devicectl device simulate location clear",
+        "--device <udid>",
+    ),
     ("devicectl manage ddis update", ""),
     (
         "xcodebuild test-without-building",
@@ -109,6 +118,8 @@ const VALUE_OPTS: &[&str] = &[
     "--profile",
     "--output",
     "--domain",
+    "--latitude",
+    "--longitude",
 ];
 
 /// Human-readable output goes to stderr when the JSON document takes stdout.
@@ -385,6 +396,31 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
             xctest::signal_process(&t, pid.into(), sig)?;
             say(format!("Sent {name} to process {pid}."));
             json!({"deviceIdentifier": t.udid, "process": {"processIdentifier": pid}})
+        }
+        "devicectl device reboot" => {
+            let mut d = Device::open(a.udid(), true, 1)?;
+            services::restart(&mut d.connect_service(services::DIAGNOSTICS)?)?;
+            say(format!("Rebooting device {}.", d.udid()));
+            json!({"deviceIdentifier": d.udid()})
+        }
+        "devicectl device simulate location coordinate" => {
+            let deg = |k: &str, max: f64| {
+                a.opt(k)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|v| v.abs() <= max)
+                    .ok_or_else(|| Error::msg(format!("{k} takes degrees from -{max} to {max}")))
+            };
+            let (lat, lon) = (deg("--latitude", 90.0)?, deg("--longitude", 180.0)?);
+            let t = open_tunnel(a)?;
+            xctest::simulate_location(&t, Some((lat, lon)))?;
+            say(format!("Simulating location {lat}, {lon}."));
+            json!({"deviceIdentifier": t.udid, "latitude": lat, "longitude": lon})
+        }
+        "devicectl device simulate location clear" => {
+            let t = open_tunnel(a)?;
+            xctest::simulate_location(&t, None)?;
+            say("Location simulation cleared.");
+            json!({"deviceIdentifier": t.udid})
         }
         "devicectl device capture screenshot" => {
             let dest = a
