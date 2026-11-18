@@ -11,6 +11,7 @@ pub const INSTALLATION_PROXY: &str = "com.apple.mobile.installation_proxy";
 pub const ZIP_CONDUIT: &str = "com.apple.streaming_zip_conduit";
 pub const AMFI: &str = "com.apple.amfi.lockdown";
 pub const DIAGNOSTICS: &str = "com.apple.mobile.diagnostics_relay";
+pub const MC_INSTALL: &str = "com.apple.mobile.MCInstall";
 
 /// AMFI developer mode actions: 0 reveals the toggle in Settings, 1 turns developer mode on (the
 /// device restarts; refused while a passcode is set), 2 confirms it after the restart.
@@ -44,6 +45,41 @@ pub fn restart(s: &mut (impl Read + Write)) -> Result<()> {
         Some("Success") => Ok(()),
         _ => bail(format!("restart was refused: {r:?}")),
     }
+}
+
+/// One MCInstall request, such as GetProfileList or GetCloudConfiguration; its reply.
+pub fn mc_install(s: &mut (impl Read + Write), request: &str) -> Result<Dictionary> {
+    write_plist(s, &dict(&[("RequestType", request.into())]))?;
+    let r = read_plist(s)?;
+    match r.get("Status").and_then(|v| v.as_string()) {
+        Some("Acknowledged") => Ok(r),
+        _ => bail(format!("{request} was refused: {r:?}")),
+    }
+}
+
+/// GetProfileList's reply as one dictionary per profile, in install order: its `identifier` plus
+/// its ProfileManifest and ProfileMetadata entries.
+pub fn profiles(reply: &Dictionary) -> Vec<Dictionary> {
+    let ids = reply.get("OrderedIdentifiers").and_then(|v| v.as_array());
+    let entry = |part: &str, id: &str| {
+        reply
+            .get(part)
+            .and_then(|v| v.as_dictionary())
+            .and_then(|m| m.get(id))
+            .and_then(|v| v.as_dictionary())
+            .cloned()
+            .unwrap_or_default()
+    };
+    ids.into_iter()
+        .flatten()
+        .filter_map(|id| id.as_string())
+        .map(|id| {
+            let mut p = dict(&[("identifier", id.into())]);
+            p.extend(entry("ProfileManifest", id));
+            p.extend(entry("ProfileMetadata", id));
+            p
+        })
+        .collect()
 }
 
 pub fn browse_request(app_type: &str, show_launch_prohibited: bool) -> Dictionary {
@@ -372,6 +408,35 @@ mod tests {
         let mut v = vec![];
         write_plist(&mut v, d).unwrap();
         v
+    }
+
+    #[test]
+    fn profiles_join_manifest_and_metadata() {
+        let by_id = |id: &str, pairs: &[(&str, plist::Value)]| {
+            plist::Value::from(dict(&[(id, dict(pairs).into())]))
+        };
+        let reply = dict(&[
+            ("OrderedIdentifiers", vec!["com.mosyle.mdm".into()].into()),
+            (
+                "ProfileManifest",
+                by_id("com.mosyle.mdm", &[("IsActive", true.into())]),
+            ),
+            (
+                "ProfileMetadata",
+                by_id(
+                    "com.mosyle.mdm",
+                    &[("PayloadRemovalDisallowed", true.into())],
+                ),
+            ),
+            ("Status", "Acknowledged".into()),
+        ]);
+        let want = dict(&[
+            ("identifier", "com.mosyle.mdm".into()),
+            ("IsActive", true.into()),
+            ("PayloadRemovalDisallowed", true.into()),
+        ]);
+        assert_eq!(profiles(&reply), [want]);
+        assert!(profiles(&Dictionary::new()).is_empty());
     }
 
     #[test]

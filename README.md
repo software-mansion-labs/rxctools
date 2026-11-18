@@ -63,13 +63,14 @@ with their SHA-256 in `SHA256SUMS`.
 | `rxc devicectl device info apps [--include-default-apps] [--include-all-apps] [--bundle-id <id>]` | third-party apps unless asked for Apple's |
 | `rxc devicectl device install app <.app or .ipa>`, `device uninstall app <bundle-id>` | |
 | `rxc devicectl device info ddiServices [--no-auto-mount-ddis]` | mounts the iOS 17+ personalized developer disk image, signed for the device by Apple's TSS. With Developer Mode off it shows the toggle in Settings, as Xcode does |
-| `rxc devicectl manage ddis update` | only downloads that image, into `~/.cache/rxc/ddis` |
+| `rxc devicectl manage ddis update --source-dir <dir>` | copies that image from `<dir>`, such as Xcode's `/Library/Developer/DeveloperDiskImages/iOS_DDI`, into `~/.cache/rxc/ddis`. rxc comes with no image of its own |
 | `rxc devicectl device reboot` | full reboot through lockdown, no tunnel needed |
 | `rxc devicectl device info processes`, `device process launch [--terminate-existing] [--environment-variables <json>] [--payload-url <url>] <bundle-id> [<arguments> ...]`, `device process terminate --pid <pid> [--kill]`, `device capture screenshot --destination <png>`, `device simulate location coordinate --latitude <degrees> --longitude <degrees>`, `device simulate location clear` | need `rxc tunnel run` |
 | `rxc xcodebuild test-without-building -xctestrun <file> -destination id=<udid>` | needs `rxc tunnel run`; the runner's output goes to stdout |
 | `rxc devmodectl single <udid>` | turns Developer Mode on, waits for the restart and confirms it |
 | `rxc tunnel run`, `rxc tunnel list` | holds the iOS 17+ tunnel open in user space, without root, and tells the commands above where to find it on `--tunnel` (default `127.0.0.1:50550`) |
 | `rxc sign app <.app or .ipa> --p12 <file> --profile <mobileprovision> [--p12-password <password>] [--output <path>] [--bundle-id <id>] [--install]` | signs the way Xcode does for iOS, nested bundles and dylibs included, with entitlements from the profile; app extensions get the profile too, and FairPlay-encrypted (App Store) builds are refused; no keychain needed |
+| `rxc profile list`, `rxc profile cloud-configuration` | installed configuration profiles, and the cloud configuration with `IsSupervised`; read only |
 | `rxc lockdown get [--domain <domain>] [<key>]`, `rxc lockdown set [--domain <domain>] <key> <string value>` | e.g. `get PasswordProtected`, `get --domain com.apple.fmip IsAssociated`, `set --domain com.apple.international Language en` |
 
 Common options are devicectl's: `--device`/`-d` (the first device when left out), `-v`, `-q`, and

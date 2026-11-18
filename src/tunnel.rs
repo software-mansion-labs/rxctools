@@ -9,13 +9,15 @@ use mio::{Events, Interest, Poll, Token};
 use serde_json::{Value as J, json};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device as PhyDevice, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv6Address};
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv6Addr, TcpStream};
+use std::io::{BufReader, ErrorKind, Read, Write};
+use std::net::{Ipv6Addr, SocketAddrV6, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 pub const CORE_DEVICE_PROXY: &str = "com.apple.internal.devicecompute.CoreDeviceProxy";
@@ -219,6 +221,7 @@ const CLIENT_BUF: usize = 1 << 20;
 struct Client {
     sock: MioTcp,
     handle: Option<SocketHandle>,
+    udp: Option<SocketHandle>,
     to_dev: Vec<u8>,
     to_client: Vec<u8>,
     eof: bool,
@@ -227,11 +230,30 @@ struct Client {
     dead: bool,
 }
 
+impl Client {
+    fn flush(&mut self) {
+        while !self.to_client.is_empty() {
+            match self.sock.write(&self.to_client) {
+                Ok(n) => {
+                    self.to_client.drain(..n);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.dead = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub struct Shared {
     pub info: Mutex<Option<J>>,
 }
 
-/// Runs until the device goes away. Logs "tunnel ready" once services are reachable.
+/// Runs until the device goes away. Logs "tunnel ready" once services are reachable. Meant for
+/// `rxc tunnel run`: it exits the process when the RSD handshake through the tunnel fails.
 pub fn run_daemon(udid: Option<&str>, api: &str, proxy_port: u16) -> Result<()> {
     let shared = Arc::new(Shared {
         info: Mutex::new(None),
@@ -244,7 +266,124 @@ pub fn run_daemon(udid: Option<&str>, api: &str, proxy_port: u16) -> Result<()> 
     }
     crate::debug!("tunnel API listening", "address" => api);
 
-    let mut dev = Device::open(udid, true, 1)?;
+    let (mut link, params, udid) = open_link(&mut Device::open(udid, true, 1)?)?;
+
+    let listener_std = std::net::TcpListener::bind(("127.0.0.1", proxy_port))?;
+    let proxy_port = listener_std.local_addr()?.port();
+    listener_std.set_nonblocking(true)?;
+    let mut listener = MioListener::from_std(listener_std);
+
+    // Cache the RSD service list in the background, through our own proxy, then announce.
+    {
+        let shared = shared.clone();
+        let (addr, rsd_port, udid) = (params.server_address, params.server_rsd_port, udid.clone());
+        std::thread::spawn(move || {
+            let services = (|| -> Result<BTreeMap<String, u16>> {
+                let s = proxy_connect(proxy_port, addr, rsd_port)?;
+                Ok(xpc::rsd_handshake(s)?.services)
+            })();
+            let services = match services {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::util::log(
+                        "ERROR",
+                        "RSD handshake through the tunnel failed",
+                        &[("err", json!(e.0))],
+                    );
+                    std::process::exit(1);
+                }
+            };
+            *shared.info.lock().unwrap() = Some(json!({
+                "identifier": udid, "address": addr.to_string(), "rsdPort": rsd_port,
+                "proxyPort": proxy_port, "services": services,
+            }));
+            crate::info!("tunnel ready", "device" => udid, "proxyPort" => proxy_port);
+        });
+    }
+
+    event_loop(&mut link, &mut listener, &params, &AtomicBool::new(false))
+}
+
+/// The device's RSD handshake, read through a tunnel of its own that closes afterwards, so no
+/// `rxc tunnel run` is needed. Reuses `dev`'s lockdown session; the tunnel takes one more
+/// connection, a warm spare if `dev` has one left.
+pub fn rsd_handshake(dev: &mut Device) -> Result<xpc::Rsd> {
+    Ok(open(dev)?.rsd.clone())
+}
+
+/// A tunnel of this process's own, open until dropped; `tunnel` reaches it like the one
+/// `rxc tunnel run` holds. Reuses `dev`'s lockdown session, as [`rsd_handshake`] does.
+pub struct OwnTunnel {
+    pub tunnel: Tunnel,
+    pub rsd: xpc::Rsd,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Result<()>>>,
+}
+
+pub fn open(dev: &mut Device) -> Result<OwnTunnel> {
+    let (mut link, params, udid) = open_link(dev)?;
+    let l = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let proxy_port = l.local_addr()?.port();
+    l.set_nonblocking(true)?;
+    let mut listener = MioListener::from_std(l);
+    let (address, rsd_port) = (params.server_address, params.server_rsd_port);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let stop = stop.clone();
+        std::thread::spawn(move || event_loop(&mut link, &mut listener, &params, &stop))
+    };
+    let mut t = OwnTunnel {
+        tunnel: Tunnel {
+            address,
+            rsd_port,
+            udid,
+            proxy_port,
+            services: BTreeMap::new(),
+        },
+        rsd: xpc::Rsd {
+            udid: String::new(),
+            uuid: None,
+            services: BTreeMap::new(),
+        },
+        stop,
+        thread: Some(thread),
+    };
+    let rsd = t.tunnel.connect(rsd_port).and_then(|s| {
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        xpc::rsd_handshake(s)
+    });
+    match rsd {
+        Ok(rsd) => {
+            t.tunnel.services = rsd.services.clone();
+            t.rsd = rsd;
+            Ok(t)
+        }
+        // a tunnel that broke explains the failed read better than the read does
+        Err(e) => Err(t.close().err().unwrap_or(e)),
+    }
+}
+
+impl OwnTunnel {
+    fn close(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        // a connection wakes the loop at once to see the stop
+        let _ = TcpStream::connect(("127.0.0.1", self.tunnel.proxy_port));
+        match self.thread.take().map(|t| t.join()) {
+            Some(Ok(r)) => r,
+            Some(Err(_)) => bail("the tunnel thread panicked"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for OwnTunnel {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+/// CoreDeviceProxy's TLS link to the device, after the CDTunnel handshake.
+fn open_link(dev: &mut Device) -> Result<(Link, TunnelParams, String)> {
     let udid = dev.udid().to_string();
     crate::info!("connecting tunnel", "device" => udid);
     let mut stream = dev.connect_service(CORE_DEVICE_PROXY)?;
@@ -272,44 +411,16 @@ pub fn run_daemon(udid: Option<&str>, api: &str, proxy_port: u16) -> Result<()> 
         inbuf: vec![],
     };
     link.tls.set_buffer_limit(None);
-
-    let listener_std = std::net::TcpListener::bind(("127.0.0.1", proxy_port))?;
-    let proxy_port = listener_std.local_addr()?.port();
-    listener_std.set_nonblocking(true)?;
-    let mut listener = MioListener::from_std(listener_std);
-
-    // Cache the RSD service list in the background, through our own proxy, then announce.
-    {
-        let shared = shared.clone();
-        let (addr, rsd_port, udid) = (params.server_address, params.server_rsd_port, udid.clone());
-        std::thread::spawn(move || {
-            let services = (|| -> Result<BTreeMap<String, u16>> {
-                let s = proxy_connect(proxy_port, addr, rsd_port)?;
-                Ok(xpc::rsd_handshake(s)?.1)
-            })();
-            let services = match services {
-                Ok(s) => s,
-                Err(e) => {
-                    crate::util::log(
-                        "ERROR",
-                        "RSD handshake through the tunnel failed",
-                        &[("err", json!(e.0))],
-                    );
-                    std::process::exit(1);
-                }
-            };
-            *shared.info.lock().unwrap() = Some(json!({
-                "identifier": udid, "address": addr.to_string(), "rsdPort": rsd_port,
-                "proxyPort": proxy_port, "services": services,
-            }));
-            crate::info!("tunnel ready", "device" => udid, "proxyPort" => proxy_port);
-        });
-    }
-
-    event_loop(&mut link, &mut listener, &params)
+    Ok((link, params, udid))
 }
 
-fn event_loop(link: &mut Link, listener: &mut MioListener, params: &TunnelParams) -> Result<()> {
+/// Runs the tunnel until `stop` is set; it is checked at least every 500 ms.
+fn event_loop(
+    link: &mut Link,
+    listener: &mut MioListener,
+    params: &TunnelParams,
+    stop: &AtomicBool,
+) -> Result<()> {
     const DEV: Token = Token(0);
     const LISTENER: Token = Token(1);
     let mut poll = Poll::new()?;
@@ -352,7 +463,7 @@ fn event_loop(link: &mut Link, listener: &mut MioListener, params: &TunnelParams
     let mut events = Events::with_capacity(256);
     let mut buf = vec![0u8; 256 * 1024];
 
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         let timeout = iface
             .poll_delay(now(), &sockets)
             .map(|d| Duration::from_micros(d.total_micros()));
@@ -383,6 +494,7 @@ fn event_loop(link: &mut Link, listener: &mut MioListener, params: &TunnelParams
                                 Client {
                                     sock: s,
                                     handle: None,
+                                    udp: None,
                                     to_dev: vec![],
                                     to_client: vec![],
                                     eof: false,
@@ -416,21 +528,40 @@ fn event_loop(link: &mut Link, listener: &mut MioListener, params: &TunnelParams
                     }
                 }
             }
-            if c.handle.is_none() && c.to_dev.len() >= 20 {
+            if c.handle.is_none() && c.udp.is_none() && c.to_dev.len() >= 20 {
                 let ip: [u8; 16] = c.to_dev[..16].try_into().unwrap();
                 let port = u32::from_le_bytes(c.to_dev[16..20].try_into().unwrap()) as u16;
                 c.to_dev.drain(..20);
+                next_port = if next_port >= 65000 {
+                    49152
+                } else {
+                    next_port + 1
+                };
+                // The unspecified address asks for a UDP port on the tunnel instead: the reply is
+                // our address and that port, then each datagram behind its u16 length.
+                if ip == [0; 16] {
+                    let mut s = udp::Socket::new(
+                        udp::PacketBuffer::new(
+                            vec![udp::PacketMetadata::EMPTY; 2048],
+                            vec![0; 1 << 21],
+                        ),
+                        udp::PacketBuffer::new(vec![], vec![]),
+                    );
+                    if s.bind(next_port).is_err() {
+                        c.dead = true;
+                        continue;
+                    }
+                    c.to_client.extend_from_slice(&client_addr.octets());
+                    c.to_client.extend_from_slice(&next_port.to_be_bytes());
+                    c.udp = Some(sockets.add(s));
+                    continue;
+                }
                 let mut s = tcp::Socket::new(
                     tcp::SocketBuffer::new(vec![0; 1 << 20]),
                     tcp::SocketBuffer::new(vec![0; 1 << 20]),
                 );
                 s.set_nagle_enabled(false);
                 s.set_ack_delay(None);
-                next_port = if next_port >= 65000 {
-                    49152
-                } else {
-                    next_port + 1
-                };
                 let remote = IpEndpoint::new(IpAddress::Ipv6(Ipv6Address::from(ip)), port);
                 if s.connect(iface.context(), remote, next_port).is_err() {
                     c.dead = true;
@@ -448,6 +579,19 @@ fn event_loop(link: &mut Link, listener: &mut MioListener, params: &TunnelParams
             iface.poll(now(), &mut device, &mut sockets);
             let mut progress = false;
             for c in clients.values_mut() {
+                if let Some(h) = c.udp {
+                    // a full buffer leaves datagrams to the stack, which drops them when it fills up
+                    let s = sockets.get_mut::<udp::Socket>(h);
+                    while c.to_client.len() < CLIENT_BUF
+                        && let Ok((d, _)) = s.recv()
+                    {
+                        c.to_client
+                            .extend_from_slice(&(d.len() as u16).to_be_bytes());
+                        c.to_client.extend_from_slice(d);
+                        progress = true;
+                    }
+                    c.flush();
+                }
                 let Some(h) = c.handle else { continue };
                 let s = sockets.get_mut::<tcp::Socket>(h);
                 if s.may_send() {
@@ -475,19 +619,7 @@ fn event_loop(link: &mut Link, listener: &mut MioListener, params: &TunnelParams
                         _ => break,
                     }
                 }
-                while !c.to_client.is_empty() {
-                    match c.sock.write(&c.to_client) {
-                        Ok(n) => {
-                            c.to_client.drain(..n);
-                        }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                        Err(_) => {
-                            c.dead = true;
-                            break;
-                        }
-                    }
-                }
+                c.flush();
                 let st = s.state();
                 let remote_done =
                     (c.was_connected && !s.may_recv() && !s.can_recv()) || st == tcp::State::Closed;
@@ -520,9 +652,13 @@ fn event_loop(link: &mut Link, listener: &mut MioListener, params: &TunnelParams
                 iface.poll(now(), &mut device, &mut sockets);
                 sockets.remove(h);
             }
+            if let Some(h) = c.udp {
+                sockets.remove(h);
+            }
         }
         link.write(&mut device.tx)?;
     }
+    Ok(())
 }
 
 /// Opens a TCP connection to `addr:port` on the device through the daemon's userspace proxy.
@@ -601,6 +737,27 @@ pub fn http_get(api: &str, path: &str) -> Result<(u16, String)> {
     Ok((code, body))
 }
 
+/// A UDP port on the tunnel: what the device sends to `address` arrives through [`Udp::recv`]. The
+/// port closes when this is dropped.
+pub struct Udp {
+    pub address: SocketAddrV6,
+    s: BufReader<TcpStream>,
+}
+
+impl Udp {
+    /// The next datagram, into `buf`.
+    pub fn recv(&mut self, buf: &mut Vec<u8>) -> Result<()> {
+        let mut n = [0u8; 2];
+        self.s.read_exact(&mut n)?;
+        buf.resize(u16::from_be_bytes(n) as usize, 0);
+        Ok(self.s.read_exact(buf)?)
+    }
+
+    pub fn set_read_timeout(&self, t: Option<Duration>) -> Result<()> {
+        Ok(self.s.get_ref().set_read_timeout(t)?)
+    }
+}
+
 /// A running tunnel as the tunnel API describes it, plus the RSD services.
 #[derive(Clone)]
 pub struct Tunnel {
@@ -662,7 +819,7 @@ impl Tunnel {
                     .filter_map(|(k, v)| Some((k.clone(), v.as_u64()? as u16)))
                     .collect()
             }
-            None => t.services = xpc::rsd_handshake(t.connect(rsd_port)?)?.1,
+            None => t.services = xpc::rsd_handshake(t.connect(rsd_port)?)?.services,
         }
         Ok(t)
     }
@@ -681,6 +838,19 @@ impl Tunnel {
 
     pub fn connect_service(&self, service: &str) -> Result<TcpStream> {
         self.connect(self.port(service)?)
+    }
+
+    /// A UDP port on the tunnel's host address, for the device to send to.
+    pub fn bind_udp(&self) -> Result<Udp> {
+        let mut s = proxy_connect(self.proxy_port, Ipv6Addr::UNSPECIFIED, 0)?;
+        let mut a = [0u8; 18];
+        s.read_exact(&mut a)?;
+        let ip: [u8; 16] = a[..16].try_into().unwrap();
+        let port = u16::from_be_bytes([a[16], a[17]]);
+        Ok(Udp {
+            address: SocketAddrV6::new(ip.into(), port, 0, 0),
+            s: BufReader::with_capacity(1 << 16, s),
+        })
     }
 
     /// Shim services speak the lockdown plist protocol after an RSDCheckin.

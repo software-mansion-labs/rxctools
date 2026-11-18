@@ -1,5 +1,5 @@
 //! Developer disk images through mobile_image_mounter: list and mount the iOS 17+
-//! personalized image, which Apple's TSS signs for each device and nonce, and download it.
+//! personalized image, which Apple's TSS signs for each device and nonce, from a copy of Xcode's.
 
 use crate::lockdown::{DevStream, Device, dict, read_plist, write_plist};
 use crate::util::{Error, Result, bail};
@@ -9,11 +9,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 pub const SERVICE: &str = "com.apple.mobile.mobile_image_mounter";
-/// The universal iOS 17+ personalized image; a copy already under the base dir is reused.
-const DDI: &str = "ddi-17E5179g";
-const DDI_URL: &str = "https://deviceboxhq.com/ddi-17E5179g.zip";
-/// That zip's SHA-256: a changed or cut-short download fails here, not on the device.
-const DDI_SHA256: &str = "b74e5d038df88fcf954f2a503bcbeb94a3fb78ad508a557665ac6bf325bece1a";
+/// Where `install` puts the image it copies.
+const INSTALLED: &str = "installed";
 const TSS_URL: &str = "https://gs.apple.com/TSS/controller?action=2";
 
 fn call(s: &mut DevStream, req: Dictionary) -> Result<Dictionary> {
@@ -239,7 +236,7 @@ fn component_path(identity: &Dictionary, names: &[&str]) -> Result<String> {
         .ok_or_else(|| Error::msg(format!("build manifest has no path for {}", names[0])))
 }
 
-/// `base/rel`, refusing a `rel` that would leave `base` (the manifest comes from a download).
+/// `base/rel`, refusing a `rel` that would leave `base` (the manifest comes from a directory the user names).
 fn safe_join(base: &Path, rel: &str) -> Result<PathBuf> {
     if Path::new(rel)
         .components()
@@ -391,63 +388,57 @@ fn parse_tss(s: &str) -> Result<Vec<u8>> {
         .ok_or_else(|| Error::msg("getSignature: could not get 'ApImg4Ticket' value from response"))
 }
 
-/// The personalized image's `Restore` directory under `basedir`, downloading and unpacking it the
-/// first time.
-pub fn download(basedir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(basedir)?;
-    if let Some(dir) = find_restore(basedir) {
-        debug!("developer disk image found", "path" => dir.display().to_string());
-        return Ok(dir);
-    }
-    let archive = basedir.join(format!("{DDI}.zip"));
-    let dest = basedir.join(DDI);
-    // other rxc processes may be setting the image up too: work under hidden names of our own,
-    // which find_restore skips, then rename into place
-    let own = |what: &str| basedir.join(format!(".{DDI}.{}.{what}", std::process::id()));
-    let sha256 = |p: &Path| {
-        std::fs::read(p)
-            .map(|b| crate::util::hex(ring::digest::digest(&ring::digest::SHA256, &b).as_ref()))
+/// The `Restore` directory `install` copied under `basedir`.
+pub fn installed(basedir: &Path) -> Option<PathBuf> {
+    let dir = basedir.join(INSTALLED).join("Restore");
+    dir.join("BuildManifest.plist").is_file().then_some(dir)
+}
+
+/// Copies the image in `src`, a `Restore` directory or one holding it (such as Xcode's
+/// /Library/Developer/DeveloperDiskImages/iOS_DDI), under `basedir` in place of one copied before.
+pub fn install(src: &Path, basedir: &Path) -> Result<PathBuf> {
+    let itself = src
+        .join("BuildManifest.plist")
+        .is_file()
+        .then(|| src.to_path_buf());
+    let Some(restore) = itself.or_else(|| find_restore(src)) else {
+        return bail(format!(
+            "no Restore directory with a BuildManifest.plist in {}",
+            src.display()
+        ));
     };
-    if sha256(&archive).ok().as_deref() != Some(DDI_SHA256) {
-        info!("downloading the developer disk image", "url" => DDI_URL, "path" => archive.display().to_string());
-        let part = own("zip");
-        let status =
-            crate::util::https("GET", DDI_URL, &[], &[], &mut std::fs::File::create(&part)?)?;
-        let got = sha256(&part)?;
-        let problem = if status != 200 {
-            format!("unexpected status code {status}")
-        } else if got != DDI_SHA256 {
-            format!("SHA-256 {got}, expected {DDI_SHA256}")
-        } else {
-            String::new()
-        };
-        if !problem.is_empty() {
-            let _ = std::fs::remove_file(&part);
-            return bail(format!("downloading {DDI_URL}: {problem}"));
+    fn copy(from: &Path, to: &Path) -> Result<()> {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)? {
+            let e = e?;
+            if e.file_type()?.is_dir() {
+                copy(&e.path(), &to.join(e.file_name()))?;
+            } else {
+                std::fs::copy(e.path(), to.join(e.file_name()))?;
+            }
         }
-        std::fs::rename(&part, &archive)?;
+        Ok(())
     }
-    let unpacked = own("unzip");
-    if let Err(e) = crate::util::unzip(&archive, &unpacked) {
-        let _ = std::fs::remove_dir_all(&unpacked);
+    // copied under a name of our own, then renamed into place, as other rxc processes may be
+    // copying too
+    let part = basedir.join(format!(".{INSTALLED}.{}", std::process::id()));
+    if let Err(e) = copy(&restore, &part.join("Restore")) {
+        let _ = std::fs::remove_dir_all(&part);
         return Err(e);
     }
-    if std::fs::rename(&unpacked, &dest).is_err() {
-        // another process got there first
-        let _ = std::fs::remove_dir_all(&unpacked);
-    }
+    let dest = basedir.join(INSTALLED);
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::rename(&part, &dest)?;
     Ok(dest.join("Restore"))
 }
 
-/// A `Restore` directory with a BuildManifest.plist anywhere under `basedir`: the pinned image by
-/// the name of the directory holding it, then one whose name contains the pinned name, then the
-/// first in path order.
+/// The first `Restore` directory with a BuildManifest.plist under `basedir` in path order, so
+/// iOS_DDI's in Xcode's DeveloperDiskImages.
 fn find_restore(basedir: &Path) -> Option<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let p = e.path();
-            let hidden = e.file_name().to_string_lossy().starts_with('.');
-            if p.is_dir() && !p.is_symlink() && !hidden {
+            if p.is_dir() && !p.is_symlink() {
                 if p.file_name().is_some_and(|n| n == "Restore")
                     && p.join("BuildManifest.plist").is_file()
                 {
@@ -459,19 +450,7 @@ fn find_restore(basedir: &Path) -> Option<PathBuf> {
     }
     let mut dirs = vec![];
     walk(basedir, &mut dirs);
-    dirs.sort();
-    let name = |p: &PathBuf| {
-        p.parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default()
-    };
-    let pick = dirs
-        .iter()
-        .find(|p| name(p) == DDI)
-        .or_else(|| dirs.iter().find(|p| name(p).contains(DDI)))
-        .or(dirs.first());
-    pick.cloned()
+    dirs.into_iter().min()
 }
 
 #[cfg(test)]
@@ -685,23 +664,30 @@ mod tests {
     }
 
     #[test]
-    fn present_image_selection() {
-        let base = std::env::temp_dir().join(format!("rxc-ddi-{}", std::process::id()));
-        let write = |dir: &Path| {
-            std::fs::create_dir_all(dir.join("Restore")).unwrap();
-            std::fs::write(dir.join("Restore/BuildManifest.plist"), "m").unwrap();
-            dir.join("Restore")
+    fn install_from_source_dir() {
+        let base = std::env::temp_dir().join(format!("rxc-ddi-install-{}", std::process::id()));
+        let write = |dir: &Path, manifest: &str| {
+            std::fs::create_dir_all(dir.join("Restore/Firmware")).unwrap();
+            std::fs::write(dir.join("Restore/BuildManifest.plist"), manifest).unwrap();
+            std::fs::write(dir.join("Restore/Firmware/tc"), "t").unwrap();
         };
-        // another process still unpacking
-        write(&base.join(format!(".{DDI}.1.unzip")));
-        assert_eq!(find_restore(&base), None);
-        let ancestor = write(&base.join(format!("{DDI}-backup/someimage")));
-        assert_eq!(find_restore(&base), Some(ancestor));
-        let older = write(&base.join("ddi-15F31d"));
-        assert_eq!(find_restore(&base), Some(older), "first in path order");
-        write(&base.join(format!("aaaa-{DDI}-copy")));
-        let pinned = write(&base.join(DDI));
-        assert_eq!(find_restore(&base), Some(pinned));
+        let src = base.join("DeveloperDiskImages");
+        write(&src.join("tvOS_DDI"), "tv");
+        write(&src.join("iOS_DDI"), "ios");
+        let host = base.join("host");
+        assert_eq!(installed(&host), None);
+        let got = install(&src, &host).unwrap();
+        assert_eq!(installed(&host), Some(got.clone()));
+        let manifest = || std::fs::read_to_string(got.join("BuildManifest.plist")).unwrap();
+        assert_eq!(manifest(), "ios", "iOS_DDI before tvOS_DDI");
+        assert_eq!(std::fs::read(got.join("Firmware/tc")).unwrap(), b"t");
+        let tv = install(&src.join("tvOS_DDI/Restore"), &host).unwrap();
+        assert_eq!(
+            (tv, manifest()),
+            (got.clone(), "tv".into()),
+            "a Restore directory, replacing the copy"
+        );
+        assert!(install(&base.join("none"), &host).is_err());
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

@@ -4,20 +4,9 @@
 //! `rxc tunnel` and `rxc sign` do what Xcode keeps to itself, and `rxc lockdown` reads and writes
 //! the device's lockdown values.
 
-mod der;
-mod dtx;
-mod image;
-mod instruments;
-mod lockdown;
-mod nskeyed;
-mod p12;
-mod services;
-mod sign;
-mod tunnel;
-mod usbmux;
-mod util;
-mod xctest;
-mod xpc;
+use rxctools::{
+    debug, image, info, instruments, lockdown, services, sign, tunnel, usbmux, util, xctest,
+};
 
 use lockdown::Device;
 use serde_json::{Value as J, json};
@@ -69,7 +58,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "devicectl device simulate location clear",
         "--device <udid>",
     ),
-    ("devicectl manage ddis update", ""),
+    ("devicectl manage ddis update", "--source-dir <dir>"),
     (
         "xcodebuild test-without-building",
         "-xctestrun <file> -destination id=<udid>",
@@ -82,6 +71,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "<.app or .ipa> --p12 <file> [--p12-password <password>] --profile <mobileprovision> \
          [--output <path>] [--bundle-id <id>] [--install]",
     ),
+    ("profile list", "--device <udid>"),
+    ("profile cloud-configuration", "--device <udid>"),
     (
         "lockdown get",
         "--device <udid> [--domain <domain>] [<key>]",
@@ -111,6 +102,7 @@ const VALUE_OPTS: &[&str] = &[
     "--destination",
     "--tunnel",
     "--proxy-port",
+    "--source-dir",
     "-xctestrun",
     "-destination",
     "--p12",
@@ -434,7 +426,10 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
         // devmodectl takes the UDID as an argument
         "devmodectl single" => developer_mode(rest.first().map(|s| s.as_str()).or(a.udid()))?,
         "devicectl manage ddis update" => {
-            let dir = image::download(&ddi_dir())?;
+            let src = a
+                .opt("--source-dir")
+                .ok_or_else(|| Error::msg("--source-dir <dir> is required"))?;
+            let dir = image::install(Path::new(src), &ddi_dir())?;
             say(format!("Developer disk image ready in {}", dir.display()));
             json!({"hostDDI": util::file_url(&format!("{}/", dir.display()))})
         }
@@ -468,6 +463,49 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
                 .unwrap_or(true);
             xctest::run(&t, &bytes, report, out)?;
             json!({})
+        }
+        "profile list" => {
+            let mut d = Device::open(a.udid(), true, 1)?;
+            let mut s = d.connect_service(services::MC_INSTALL)?;
+            let profiles = services::profiles(&services::mc_install(&mut s, "GetProfileList")?);
+            for p in &profiles {
+                let name = p.get("PayloadDisplayName").and_then(|v| v.as_string());
+                let active = p.get("IsActive").and_then(|v| v.as_boolean()) == Some(true);
+                say(format!(
+                    "{}  {}{}",
+                    p["identifier"].as_string().unwrap_or_default(),
+                    name.unwrap_or_default(),
+                    if active { "" } else { "  (inactive)" }
+                ));
+            }
+            if profiles.is_empty() {
+                say("No configuration profiles installed.");
+            }
+            let profiles: Vec<J> = profiles
+                .into_iter()
+                .map(|p| plist_json(&p.into()))
+                .collect();
+            json!({"deviceIdentifier": d.udid(), "profiles": profiles})
+        }
+        "profile cloud-configuration" => {
+            let mut d = Device::open(a.udid(), true, 1)?;
+            let mut s = d.connect_service(services::MC_INSTALL)?;
+            let r = services::mc_install(&mut s, "GetCloudConfiguration")?;
+            let config = r
+                .get("CloudConfiguration")
+                .map(plist_json)
+                .unwrap_or(json!({}));
+            say(
+                match (
+                    config["IsSupervised"] == true,
+                    config["OrganizationName"].as_str(),
+                ) {
+                    (true, Some(org)) => format!("Supervised by {org}."),
+                    (true, None) => "Supervised.".into(),
+                    (false, _) => "Not supervised.".into(),
+                },
+            );
+            json!({"deviceIdentifier": d.udid(), "cloudConfiguration": config})
         }
         "lockdown get" => {
             let (domain, key) = (a.opt("--domain"), rest.first().map(|s| s.as_str()));
@@ -774,8 +812,7 @@ fn launch(a: &Args, bundle: &str, args: &[String]) -> Result<J> {
     Ok(json!({"deviceIdentifier": t.udid, "process": {"processIdentifier": pid}}))
 }
 
-/// Where `devicectl manage ddis update` keeps the developer disk image. A personalized image's
-/// `Restore` directory put anywhere under it is used too.
+/// Where `devicectl manage ddis update` keeps the developer disk image.
 fn ddi_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -818,7 +855,11 @@ fn ddi_services(a: &Args) -> Result<J> {
                 "Developer Mode is disabled: turn it on in Settings > Privacy & Security > Developer Mode",
             );
         }
-        let path = image::download(&ddi_dir())?;
+        let path = image::installed(&ddi_dir()).ok_or_else(|| {
+            Error::msg(
+                "no developer disk image: copy Xcode's with `rxc devicectl manage ddis update --source-dir <dir>`",
+            )
+        })?;
         image::mount(&mut d, s, &path)?;
         mounted = true;
     }
@@ -938,6 +979,7 @@ mod tests {
             "devmodectl",
             "tunnel",
             "sign",
+            "profile",
             "lockdown",
         ];
         for (c, _) in super::COMMANDS {

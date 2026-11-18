@@ -121,17 +121,20 @@ pub fn log(level: &str, msg: &str, kv: &[(&str, serde_json::Value)]) {
     eprintln!("{line}");
 }
 
+// for the logging macros, so their callers need no serde_json of their own
+pub use serde_json;
+
 #[macro_export]
 macro_rules! info {
     ($msg:expr $(, $k:expr => $v:expr)* $(,)?) => {
-        $crate::util::log("INFO", &$msg, &[$(($k, serde_json::json!($v))),*])
+        $crate::util::log("INFO", &$msg, &[$(($k, $crate::util::serde_json::json!($v))),*])
     };
 }
 
 #[macro_export]
 macro_rules! debug {
     ($msg:expr $(, $k:expr => $v:expr)* $(,)?) => {
-        $crate::util::log("DEBUG", &$msg, &[$(($k, serde_json::json!($v))),*])
+        $crate::util::log("DEBUG", &$msg, &[$(($k, $crate::util::serde_json::json!($v))),*])
     };
 }
 

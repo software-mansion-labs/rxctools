@@ -459,8 +459,17 @@ impl<S: Read + Write> XpcConn<S> {
     }
 }
 
+/// What a device says about itself in its RSD handshake.
+#[derive(Debug, Clone)]
+pub struct Rsd {
+    pub udid: String,
+    /// The handshake's `UUID`, uppercase.
+    pub uuid: Option<String>,
+    pub services: BTreeMap<String, u16>,
+}
+
 /// RSD handshake: the services the device offers through the tunnel, name -> port.
-pub fn parse_rsd_handshake(m: &X) -> Result<(String, BTreeMap<String, u16>)> {
+pub fn parse_rsd_handshake(m: &X) -> Result<Rsd> {
     if m.get("MessageType").and_then(|v| v.as_str()) != Some("Handshake") {
         return bail("Handshake: unknown response");
     }
@@ -486,10 +495,18 @@ pub fn parse_rsd_handshake(m: &X) -> Result<(String, BTreeMap<String, u16>)> {
             }
         }
     }
-    Ok((udid, out))
+    let uuid = match m.get("UUID") {
+        Some(X::Uuid(u)) => Some(uuid::Uuid::from_bytes(*u).to_string().to_uppercase()),
+        _ => None,
+    };
+    Ok(Rsd {
+        udid,
+        uuid,
+        services: out,
+    })
 }
 
-pub fn rsd_handshake<S: Read + Write>(s: S) -> Result<(String, BTreeMap<String, u16>)> {
+pub fn rsd_handshake<S: Read + Write>(s: S) -> Result<Rsd> {
     let mut c = XpcConn::connect(s)?;
     let m = c.recv_body(CLIENT_SERVER)?;
     parse_rsd_handshake(&m)
@@ -709,9 +726,15 @@ mod tests {
                 xdict(vec![("UniqueDeviceID", "00008030-001".into())]),
             ),
             ("Services", services),
+            ("UUID", X::Uuid(UUID)),
         ]);
-        let (udid, s) = parse_rsd_handshake(&m).unwrap();
-        assert_eq!(udid, "00008030-001");
+        let r = parse_rsd_handshake(&m).unwrap();
+        let s = r.services;
+        assert_eq!(r.udid, "00008030-001");
+        assert_eq!(
+            r.uuid.as_deref(),
+            Some("4588D2DB-2340-6C41-BE63-4596C6AE7FE3")
+        );
         assert_eq!(
             service_port(&s, "com.apple.dt.testmanagerd.remote"),
             Some(50340)

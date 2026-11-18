@@ -9,7 +9,7 @@ use crate::util::{Error, Result, bail};
 use crate::xpc::{self, X, XpcConn, xdict};
 use plist::Value;
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -738,7 +738,21 @@ fn coredevice(
     action: Option<&str>,
     input: X,
 ) -> Result<X> {
-    let mut c = XpcConn::connect(t.connect_service(service)?)?;
+    coredevice_call(
+        &mut XpcConn::connect(t.connect_service(service)?)?,
+        feature,
+        action,
+        input,
+    )
+}
+
+/// A CoreDevice feature on a service connection already open.
+pub(crate) fn coredevice_call(
+    c: &mut XpcConn<impl Read + Write>,
+    feature: &str,
+    action: Option<&str>,
+    input: X,
+) -> Result<X> {
     let device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
     c.send(
         xpc::coredevice_request(&device_id, feature, action, input),
