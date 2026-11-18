@@ -10,6 +10,7 @@ use crate::xpc::{X, XpcConn, xdict};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +52,7 @@ pub struct Stream {
     _tunnel: Arc<OwnTunnel>,
     udid: String,
     session: uuid::Uuid,
+    stop: Arc<AtomicBool>,
 }
 
 /// Each device's newest stream in this process. A phone streams to one session at a time and stops
@@ -93,6 +95,7 @@ pub fn start(dev: &mut Device) -> Result<(Stream, Touch)> {
         _tunnel: t.clone(),
         udid: dev.udid().to_string(),
         session,
+        stop: Arc::default(),
     };
     newest().insert(stream.udid.clone(), session);
     // the audio stream opens the screen-sharing session that the video stream joins
@@ -118,6 +121,9 @@ impl Stream {
     /// decoded, so start the stream again.
     pub fn next_frame(&mut self) -> Result<Frame> {
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return bail("screen stream: stopped");
+            }
             // the phone sends RTCP every second even when the screen does not change
             self.video.recv(&mut self.buf).map_err(|e| {
                 Error::msg(format!(
@@ -131,6 +137,12 @@ impl Stream {
                 return bail("screen stream: frames lost, the stream was read too slowly");
             }
         }
+    }
+
+    /// Set to true from any thread, it makes [`Stream::next_frame`] fail within about a second,
+    /// also while it waits for the screen to change; drop the stream then to stop it on the phone.
+    pub fn stopper(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
     }
 }
 

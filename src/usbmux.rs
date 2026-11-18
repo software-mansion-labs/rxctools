@@ -5,6 +5,7 @@ use plist::{Dictionary, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
+use std::sync::Mutex;
 
 pub enum Stream {
     Tcp(TcpStream),
@@ -32,11 +33,20 @@ impl Write for Stream {
     }
 }
 
-/// `USBMUXD_SOCKET_ADDRESS`: `host:port` is TCP, a bare path is a unix socket,
-/// `scheme://address` is explicit.
+static ADDRESS: Mutex<Option<String>> = Mutex::new(None);
+
+/// Points this process at a usbmuxd socket, given as `USBMUXD_SOCKET_ADDRESS` would be, in place
+/// of that variable, which a multi-threaded process can't set safely.
+pub fn set_socket_address(addr: &str) {
+    *ADDRESS.lock().unwrap() = Some(addr.into());
+}
+
+/// The address from [`set_socket_address`], else `USBMUXD_SOCKET_ADDRESS`: `host:port` is TCP, a
+/// bare path is a unix socket, `scheme://address` is explicit.
 pub fn socket_address() -> String {
-    match std::env::var("USBMUXD_SOCKET_ADDRESS") {
-        Ok(s) if !s.is_empty() => {
+    let set = ADDRESS.lock().unwrap().clone();
+    match set.or_else(|| std::env::var("USBMUXD_SOCKET_ADDRESS").ok()) {
+        Some(s) if !s.is_empty() => {
             if let Some(i) = s.find("://") {
                 format!("{}{}", s[..i].to_lowercase(), &s[i..])
             } else if s.contains(':') {
@@ -273,6 +283,9 @@ mod tests {
             unsafe { std::env::set_var("USBMUXD_SOCKET_ADDRESS", input) };
             assert_eq!(socket_address(), want, "input {input:?}");
         }
+        set_socket_address("/tmp/farm");
+        assert_eq!(socket_address(), "unix:///tmp/farm");
+        *ADDRESS.lock().unwrap() = None;
         unsafe { std::env::remove_var("USBMUXD_SOCKET_ADDRESS") };
     }
 
