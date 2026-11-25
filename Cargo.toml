@@ -1,6 +1,6 @@
 [package]
 name = "rxctools"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Xcode's iPhone tools without Xcode: devicectl, xcodebuild test-without-building, devmodectl and app signing on macOS and Linux"
 license = "MIT"
