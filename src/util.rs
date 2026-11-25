@@ -30,12 +30,29 @@ macro_rules! from_err {
     )*};
 }
 from_err!(
-    std::io::Error,
     plist::Error,
     rustls::Error,
     serde_json::Error,
     std::string::FromUtf8Error
 );
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        match e.kind() {
+            // what a read past its timeout returns
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                Error(format!("no answer in time ({e})"))
+            }
+            _ => Error(e.to_string()),
+        }
+    }
+}
+
+impl From<rxc_sign::Error> for Error {
+    fn from(e: rxc_sign::Error) -> Self {
+        Error(e.0)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -138,8 +155,7 @@ macro_rules! debug {
     };
 }
 
-/// https://www.apple.com/appleca/AppleIncRootCertificate.cer
-pub const APPLE_ROOT_CA: &[u8] = include_bytes!("certs/apple-root-ca.cer");
+pub use rxc_sign::APPLE_ROOT_CA;
 
 /// Minimal HTTPS client for the few internet calls rxc makes (Apple's TSS, the developer disk image
 /// download). It speaks HTTP/1.0, so the body is never chunked and ends with the connection, and it

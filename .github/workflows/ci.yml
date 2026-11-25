@@ -25,7 +25,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - run: rustup target add ${{ matrix.target }}
       - if: matrix.test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
       # musl is linked statically, so the Linux binary runs on any distribution
       - run: cargo build --release --locked --target ${{ matrix.target }}
         env:
@@ -36,9 +36,17 @@ jobs:
           name: rxc-${{ matrix.target }}
           path: rxc-${{ matrix.target }}.tar.gz
 
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add wasm32-unknown-unknown
+      # the key holder builds rxc-sign into its WebAssembly module
+      - run: cargo build --locked -p rxc-sign --target wasm32-unknown-unknown
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, wasm]
     runs-on: ubuntu-latest
     permissions:
       contents: write

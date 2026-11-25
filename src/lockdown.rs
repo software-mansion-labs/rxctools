@@ -10,12 +10,22 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub const LOCKDOWN_PORT: u16 = 62078;
 
 pub enum DevStream {
     Plain(Stream),
     Tls(Box<StreamOwned<ClientConnection, Stream>>),
+}
+
+impl DevStream {
+    pub fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            DevStream::Plain(s) => s.set_read_timeout(t),
+            DevStream::Tls(s) => s.sock.set_read_timeout(t),
+        }
+    }
 }
 
 impl Read for DevStream {
@@ -373,10 +383,12 @@ impl Device {
         let (port, ssl) = self.lockdown_session()?.start_service(name)?;
         crate::debug!("service started", "service" => name, "port" => port, "ssl" => ssl);
         let s = self.connect_port(port)?;
-        if ssl {
-            let cfg = self.tls_config()?;
-            return tls_wrap(s, cfg);
-        }
-        Ok(DevStream::Plain(s))
+        let s = match ssl {
+            true => tls_wrap(s, self.tls_config()?)?,
+            false => DevStream::Plain(s),
+        };
+        // a service may take its time, installing an app for one
+        s.set_read_timeout(None)?;
+        Ok(s)
     }
 }

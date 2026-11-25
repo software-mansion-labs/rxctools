@@ -1,69 +1,20 @@
-//! Signing identities from PKCS#12 (.p12) files, and the few X.509 fields code signing needs.
+//! Signing identities from PKCS#12 (.p12) files.
 //!
 //! Reads what Keychain Access and OpenSSL (old and new defaults) write: PKCS#12 PBE with
 //! 3DES or RC2, PBES2 with PBKDF2 and AES or 3DES, SHA-1 or SHA-256 MACs.
 
-use crate::der::{Der, oid};
 use crate::util::{Error, Result, bail};
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockModeDecrypt, InnerIvInit, KeyIvInit};
 use ring::digest;
 use ring::signature::{KeyPair, RsaKeyPair};
+use rxc_sign::der::{Der, oid};
+use rxc_sign::parse_cert;
 
 pub struct Identity {
     pub key: RsaKeyPair,
     /// DER of the certificate that goes with `key`.
     pub cert: Vec<u8>,
-}
-
-pub struct Cert<'a> {
-    /// Whole DER encodings, as CMS IssuerAndSerialNumber wants them.
-    pub issuer: &'a [u8],
-    pub serial: &'a [u8],
-    /// RSAPublicKey DER from subjectPublicKeyInfo.
-    pub public_key: &'a [u8],
-    pub common_name: String,
-    /// The team id, for Apple developer certificates.
-    pub org_unit: String,
-}
-
-pub fn parse_cert(der: &[u8]) -> Result<Cert<'_>> {
-    let mut tbs = Der(Der(Der(der).expect(0x30)?).expect(0x30)?);
-    if tbs.0.first() == Some(&0xa0) {
-        tbs.next()?; // version
-    }
-    let serial = tbs.raw()?;
-    tbs.next()?; // signature algorithm
-    let issuer = tbs.raw()?;
-    tbs.next()?; // validity
-    let (mut common_name, mut org_unit) = (String::new(), String::new());
-    let mut rdns = Der(tbs.expect(0x30)?);
-    while !rdns.is_empty() {
-        let mut atvs = Der(rdns.expect(0x31)?);
-        while !atvs.is_empty() {
-            let mut atv = Der(atvs.expect(0x30)?);
-            let (o, (_, v)) = (atv.expect(0x06)?, atv.next()?);
-            let v = String::from_utf8_lossy(v).into_owned();
-            match o {
-                oid::COMMON_NAME => common_name = v,
-                oid::ORG_UNIT => org_unit = v,
-                _ => {}
-            }
-        }
-    }
-    let mut spki = Der(tbs.expect(0x30)?);
-    spki.next()?; // algorithm
-    let public_key = match spki.expect(0x03)? {
-        [0, k @ ..] => k,
-        _ => return bail("certificate: malformed public key"),
-    };
-    Ok(Cert {
-        issuer,
-        serial,
-        public_key,
-        common_name,
-        org_unit,
-    })
 }
 
 pub fn load(p12: &[u8], password: &str) -> Result<Identity> {

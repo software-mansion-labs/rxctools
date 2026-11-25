@@ -5,7 +5,7 @@
 //! the device's lockdown values.
 
 use rxctools::{
-    debug, image, info, instruments, lockdown, services, sign, tunnel, usbmux, util, xctest,
+    debug, image, info, instruments, lockdown, services, sign, tunnel, usbmux, util, xctest, xpc,
 };
 
 use lockdown::Device;
@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use util::{Error, Result, bail};
+use xpc::X;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -50,6 +51,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "--device <udid> --destination <path>",
     ),
     ("devicectl device reboot", "--device <udid>"),
+    (
+        "devicectl device profile list",
+        "--device <udid> --type configuration",
+    ),
     (
         "devicectl device simulate location coordinate",
         "--device <udid> --latitude <degrees> --longitude <degrees>",
@@ -112,6 +117,7 @@ const VALUE_OPTS: &[&str] = &[
     "--domain",
     "--latitude",
     "--longitude",
+    "--type",
 ];
 
 /// Human-readable output goes to stderr when the JSON document takes stdout.
@@ -345,6 +351,38 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
         }
         "devicectl device info details" => details(a)?,
         "devicectl device info apps" => apps(a)?,
+        "devicectl device profile list" => {
+            if a.opt("--type") != Some("configuration") {
+                return bail("only `--type configuration` is implemented");
+            }
+            let t = open_tunnel(a)?;
+            let profiles: Vec<J> = xctest::configuration_profiles(&t)?
+                .iter()
+                .map(|p| {
+                    let mut j = xpc_json(p);
+                    // anything but a plist stays as base64 `data`
+                    if let Some(X::Data(d)) = p.get("data")
+                        && let Ok(v) = plist::from_bytes(d)
+                    {
+                        j["content"] = plist_json(&v);
+                        j.as_object_mut().map(|o| o.remove("data"));
+                    }
+                    j
+                })
+                .collect();
+            table(
+                &["Name", "Identifier", "Organization"],
+                profiles
+                    .iter()
+                    .map(|p| {
+                        ["/name", "/payloadIdentifier", "/organization"]
+                            .map(|k| at(p, k))
+                            .to_vec()
+                    })
+                    .collect(),
+            );
+            json!({"deviceIdentifier": t.udid, "profiles": profiles})
+        }
         "devicectl device info processes" => {
             let t = open_tunnel(a)?;
             let list: Vec<J> = xctest::list_processes(&t)?
@@ -531,6 +569,26 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
         }
         _ => unreachable!("{command} is in COMMANDS"),
     })
+}
+
+/// An XPC value as JSON: data in base64, dates in RFC 3339.
+fn xpc_json(v: &X) -> J {
+    match v {
+        X::Bool(b) => (*b).into(),
+        X::I64(i) => (*i).into(),
+        X::U64(u) => (*u).into(),
+        X::F64(f) => (*f).into(),
+        X::Date(ns) => {
+            let (s, n) = (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000));
+            util::rfc3339(s, (n / 1000) as u32).into()
+        }
+        X::Data(d) => util::base64(d).into(),
+        X::Str(s) => s.as_str().into(),
+        X::Uuid(u) => uuid::Uuid::from_bytes(*u).to_string().to_uppercase().into(),
+        X::Array(a) => a.iter().map(xpc_json).collect(),
+        X::Dict(d) => d.iter().map(|(k, v)| (k.clone(), xpc_json(v))).collect(),
+        X::Null | X::FileTransfer { .. } => J::Null,
+    }
 }
 
 /// A lockdown value as JSON, data in base64.
@@ -1002,6 +1060,20 @@ mod tests {
             super::plist_json(&v),
             serde_json::json!({"ProductVersion": "18.7.8", "PasswordProtected": false,
                 "UniqueChipID": u64::MAX, "Key": "AQID", "Codes": [-1]})
+        );
+    }
+
+    #[test]
+    fn xpc_values_as_json() {
+        let v = super::xpc::xdict(vec![
+            ("date", super::X::Date(1_774_358_680_000_500_000)),
+            ("uuid", super::X::Uuid([0xab; 16])),
+            ("data", super::X::Data(vec![1, 2, 3])),
+        ]);
+        assert_eq!(
+            super::xpc_json(&v),
+            serde_json::json!({"date": "2026-03-24T13:24:40.000500Z",
+                "uuid": "ABABABAB-ABAB-ABAB-ABAB-ABABABABABAB", "data": "AQID"})
         );
     }
 }

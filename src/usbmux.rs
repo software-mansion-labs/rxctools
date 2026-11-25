@@ -6,10 +6,23 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
+use std::time::Duration;
+
+/// How long rxc waits for usbmuxd's and lockdown's replies and for a service's TLS handshake.
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub enum Stream {
     Tcp(TcpStream),
     Unix(UnixStream),
+}
+
+impl Stream {
+    pub fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_read_timeout(t),
+            Stream::Unix(s) => s.set_read_timeout(t),
+        }
+    }
 }
 
 impl Read for Stream {
@@ -62,7 +75,7 @@ pub fn socket_address() -> String {
 fn open_socket() -> Result<Stream> {
     let addr = socket_address();
     let (scheme, rest) = addr.split_once("://").unwrap();
-    Ok(match scheme {
+    let s = match scheme {
         "tcp" => {
             let s = TcpStream::connect(rest)
                 .map_err(|e| Error::msg(format!("connect usbmuxd {rest}: {e}")))?;
@@ -73,7 +86,10 @@ fn open_socket() -> Result<Stream> {
             UnixStream::connect(rest)
                 .map_err(|e| Error::msg(format!("connect usbmuxd {rest}: {e}")))?,
         ),
-    })
+    };
+    // kept after Connect, so lockdown's replies are bounded too; Device::connect_service lifts it
+    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    Ok(s)
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +301,16 @@ mod tests {
         }
         set_socket_address("/tmp/farm");
         assert_eq!(socket_address(), "unix:///tmp/farm");
+        // usbmuxd's replies are waited for only so long
+        let path = std::env::temp_dir().join(format!("rxc-usbmuxd-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        set_socket_address(path.to_str().unwrap());
+        let Stream::Unix(s) = Mux::connect().unwrap().s else {
+            panic!("not a unix socket")
+        };
+        assert_eq!(s.read_timeout().unwrap(), Some(REPLY_TIMEOUT));
+        std::fs::remove_file(&path).unwrap();
         *ADDRESS.lock().unwrap() = None;
         unsafe { std::env::remove_var("USBMUXD_SOCKET_ADDRESS") };
     }
