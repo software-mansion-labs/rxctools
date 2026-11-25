@@ -21,7 +21,7 @@ rxc devicectl device process launch --device <udid> com.apple.Preferences     # 
 
 | Xcode tool | rxctools | Covers |
 |---|---|---|
-| `xcrun devicectl` | `rxc devicectl` | `list devices`; `device info details`, `apps`, `processes`, `ddiServices`; `device install app`, `device uninstall app`; `device process launch`, `terminate`; `device capture screenshot`; `device reboot`; `device simulate location coordinate`, `clear`; `manage ddis update` |
+| `xcrun devicectl` | `rxc devicectl` | `list devices`; `device info details`, `apps`, `processes`, `ddiServices`; `device install app`, `device uninstall app`; `device process launch`, `terminate`; `device capture screenshot`; `device reboot`; `device simulate location coordinate`, `clear`; `device profile list --type configuration`; `manage ddis update` |
 | `xcodebuild` | `rxc xcodebuild` | `test-without-building` for iOS 17+ |
 | `devmodectl` | `rxc devmodectl` | `single` |
 | none, Xcode keeps its tunnels to itself | `rxc tunnel` | `run`, `list` |
@@ -69,7 +69,8 @@ with their SHA-256 in `SHA256SUMS`.
 | `rxc xcodebuild test-without-building -xctestrun <file> -destination id=<udid>` | needs `rxc tunnel run`; the runner's output goes to stdout |
 | `rxc devmodectl single <udid>` | turns Developer Mode on, waits for the restart and confirms it |
 | `rxc tunnel run`, `rxc tunnel list` | holds the iOS 17+ tunnel open in user space, without root, and tells the commands above where to find it on `--tunnel` (default `127.0.0.1:50550`) |
-| `rxc sign app <.app or .ipa> --p12 <file> --profile <mobileprovision> [--p12-password <password>] [--output <path>] [--bundle-id <id>] [--install]` | signs the way Xcode does for iOS, nested bundles and dylibs included, with entitlements from the profile; app extensions get the profile too, and FairPlay-encrypted (App Store) builds are refused; no keychain needed |
+| `rxc sign app <.app or .ipa> --p12 <file> --profile <mobileprovision> [--p12-password <password>] [--output <path>] [--bundle-id <id>] [--install]` | signs the way Xcode does for iOS, nested bundles and dylibs included, with entitlements from the profile; app extensions get the profile too, and FairPlay-encrypted (App Store) builds are refused; an `.app` comes out as an `.ipa` when `--output` ends in `.ipa`; no keychain needed |
+| `rxc devicectl device profile list --type configuration` | needs `rxc tunnel run`; every configuration profile, MDM's included, with its content as JSON (`content`), passwords left out |
 | `rxc profile list`, `rxc profile cloud-configuration` | installed configuration profiles, and the cloud configuration with `IsSupervised`; read only |
 | `rxc lockdown get [--domain <domain>] [<key>]`, `rxc lockdown set [--domain <domain>] <key> <string value>` | e.g. `get PasswordProtected`, `get --domain com.apple.fmip IsAssociated`, `set --domain com.apple.international Language en` |
 
@@ -77,7 +78,7 @@ Common options are devicectl's: `--device`/`-d` (the first device when left out)
 `--json-output`/`-j <path or ->`, which writes the document devicectl would, with results shaped
 like devicectl's. Human-readable output goes to stdout, or to stderr when the JSON does.
 
-Not implemented yet: devicectl's other commands (file copy, profiles, other settings, openURL,
+Not implemented yet: devicectl's other commands (file copy, provisioning profiles, other settings, openURL,
 screen recording, sysdiagnose, location routes and scenarios), devmodectl's `info`, `list` and
 `streaming`, syslog, crash reports, pairing, and anything below iOS 17 that needs the developer
 disk image or the tunnel.

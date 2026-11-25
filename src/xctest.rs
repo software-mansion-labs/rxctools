@@ -759,22 +759,69 @@ pub(crate) fn coredevice_call(
         xpc::HEARTBEAT_REQUEST,
     )?;
     let mut m = c.recv_body(xpc::SERVER_CLIENT)?;
-    if let Some(e) = m.get("CoreDevice.error") {
-        let info = |k| e.get("userInfo")?.get(k)?.as_str();
-        return bail(
-            match (
-                info("NSLocalizedDescription"),
-                info("NSLocalizedFailureReason"),
-            ) {
-                (Some(d), Some(r)) => format!("{d} {r}"),
-                (Some(d), None) => d.into(),
-                _ => format!("{feature} failed: {e:?}"),
-            },
-        );
-    }
+    coredevice_error(&m, feature)?;
     match &mut m {
         X::Dict(d) => Ok(d.remove("CoreDevice.output").unwrap_or(X::Null)),
         _ => bail(format!("{feature}: unexpected reply {m:?}")),
+    }
+}
+
+/// The device's `CoreDevice.error` in `m`, as an error.
+fn coredevice_error(m: &X, feature: &str) -> Result<()> {
+    let Some(e) = m.get("CoreDevice.error") else {
+        return Ok(());
+    };
+    let info = |k| e.get("userInfo")?.get(k)?.as_str();
+    bail(
+        match (
+            info("NSLocalizedDescription"),
+            info("NSLocalizedFailureReason"),
+        ) {
+            (Some(d), Some(r)) => format!("{d} {r}"),
+            (Some(d), None) => d.into(),
+            _ => format!("{feature} failed: {e:?}"),
+        },
+    )
+}
+
+/// `devicectl device profile list --type configuration`: every configuration profile on the
+/// device, MDM's included, as the device describes it; its `data` is the profile's plist, which
+/// leaves out passwords.
+pub fn configuration_profiles(t: &Tunnel) -> Result<Vec<X>> {
+    const FEATURE: &str = "com.apple.coredevice.feature.configurationprofiles";
+    let s = t.connect_service("com.apple.coredevice.configuration")?;
+    // a phone that stops answering would otherwise hold the caller's thread
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut c = XpcConn::connect(s)?;
+    let options = xdict(vec![("managementFilter", "all".into())]);
+    let input = xdict(vec![
+        ("actualInput", xdict(vec![("options", options)])),
+        // the profiles come back on this connection as a stream with this id
+        (
+            "streamProxy",
+            xdict(vec![(
+                "sideChannel",
+                X::Uuid(*uuid::Uuid::new_v4().as_bytes()),
+            )]),
+        ),
+    ]);
+    let device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    // the feature without this action installs a profile
+    let action = "com.apple.coredevice.action.configurationprofiles.list";
+    let request = xpc::coredevice_request(&device_id, FEATURE, Some(action), input);
+    c.send(request, xpc::HEARTBEAT_REQUEST)?;
+    let mut profiles = vec![];
+    loop {
+        let m = c.recv_body(xpc::CLIENT_SERVER)?;
+        coredevice_error(&m, FEATURE)?;
+        let status = m.get("CoreDevice.XPCMessageKey.sideChannelStatus");
+        match status.and_then(|s| s.get("pushing")?.get("elements")) {
+            Some(X::Array(elements)) => {
+                profiles.extend(elements.iter().filter_map(|e| e.get("profile").cloned()))
+            }
+            _ if status.and_then(|s| s.get("finishStreaming")).is_some() => return Ok(profiles),
+            _ => return bail(format!("{FEATURE}: unexpected reply {m:?}")),
+        }
     }
 }
 

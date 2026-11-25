@@ -1,7 +1,7 @@
 //! Just enough ASN.1 for PKCS#12, X.509 and CMS: a bounds-checked BER/DER reader and DER
 //! encoders.
 
-use crate::util::{Result, bail};
+use crate::{Result, bail};
 
 pub mod oid {
     pub const DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
@@ -96,6 +96,8 @@ impl<'a> Der<'a> {
     }
 
     /// The next element as (tag, content).
+    // not an Iterator: malformed input is an error, not the end
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<(u8, &'a [u8])> {
         let (tag, content, len) = parse(self.0)?;
         self.0 = &self.0[len..];
@@ -144,7 +146,7 @@ impl<'a> Der<'a> {
 
 /// (tag, content, total length) of the element at the start of `b`.
 fn parse(b: &[u8]) -> Result<(u8, &[u8], usize)> {
-    let short = || crate::util::Error::msg("ASN.1: truncated element");
+    let short = || crate::Error::msg("ASN.1: truncated element");
     let tag = *b.first().ok_or_else(short)?;
     if tag & 0x1f == 0x1f {
         return bail("ASN.1: multi-byte tags are not supported");

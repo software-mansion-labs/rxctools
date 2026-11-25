@@ -2,7 +2,6 @@
 //! tunnel, CoreDevice and RemotePairing. Synchronous; the API follows what `rxc` needs and may change
 //! between versions. Progress lines go to stderr unless `util::QUIET` is set.
 
-mod der;
 pub mod dtx;
 pub mod image;
 pub mod instruments;

@@ -5,39 +5,55 @@
 //! cdhash attributes. Nested bundles and loose Mach-O files are signed inside-out, each bundle's
 //! resources sealed in `_CodeSignature/CodeResources`.
 
-use crate::der::{self, oid};
 use crate::p12;
 use crate::util::{Error, Result, bail};
 use plist::{Dictionary, Value};
 use ring::digest::{SHA1_FOR_LEGACY_USE_ONLY as SHA1, SHA256, digest};
+use rxc_sign::{PAGE, PAGE_BITS, blob, entitlement_blobs, entitlements_for, parse_profile};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-const WWDR_G3: &[u8] = include_bytes!("certs/apple-wwdr-g3.cer");
-const PAGE_BITS: u8 = 14;
-const PAGE: usize = 1 << PAGE_BITS;
 const BUNDLE_EXTENSIONS: &[&str] = &["app", "appex", "framework", "xctest"];
-/// certificate 1[field.1.2.840.113635.100.6.2.1]: issued by Apple's developer intermediate.
-const APPLE_DEV_INTERMEDIATE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x63, 0x64, 0x06, 0x02, 0x01];
 
 pub struct Signer {
-    key: ring::signature::RsaKeyPair,
+    key: Key,
     cert: Vec<u8>,
     common_name: String,
     team: String,
 }
 
+/// What makes the CMS signatures: the p12's key, or whoever holds it.
+enum Key {
+    Local(Box<ring::signature::RsaKeyPair>),
+    Remote(Box<Cms>),
+}
+
+type Cms = dyn Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync;
+
 impl Signer {
     pub fn new(p12: &[u8], password: &str) -> Result<Signer> {
         let id = p12::load(p12, password)?;
-        let c = p12::parse_cert(&id.cert)?;
-        if c.org_unit.is_empty() {
-            return bail("the p12 certificate has no team id (subject OU)");
-        }
+        Signer::with(Key::Local(Box::new(id.key)), id.cert)
+    }
+
+    /// A signer without the private key: the certificate is the one the profile lists, and `cms`
+    /// turns each code directory into the DER CMS signature over it, as the key holder does with
+    /// [`rxc_sign::signed_attrs`] and [`rxc_sign::cms`].
+    pub fn remote(
+        profile: &[u8],
+        cms: impl Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync + 'static,
+    ) -> Result<Signer> {
+        let cert = rxc_sign::profile_cert(&parse_profile(profile)?)?;
+        Signer::with(Key::Remote(Box::new(cms)), cert)
+    }
+
+    fn with(key: Key, cert: Vec<u8>) -> Result<Signer> {
+        let (common_name, team) = rxc_sign::subject(&cert)?;
         Ok(Signer {
-            common_name: c.common_name,
-            team: c.org_unit,
-            key: id.key,
-            cert: id.cert,
+            common_name,
+            team,
+            key,
+            cert,
         })
     }
 }
@@ -52,7 +68,8 @@ pub fn default_output(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Signs `path` (.app or .ipa) into `output`, returning the bundle id it was signed for.
+/// Signs `path` (.app or .ipa) into `output`, an .ipa when its name ends in .ipa, returning the
+/// bundle id it was signed for.
 pub fn sign_app(
     path: &Path,
     output: &Path,
@@ -80,7 +97,7 @@ pub fn sign_app(
         raw: profile,
         rename: None,
     };
-    if !is_ipa(path) {
+    if !is_ipa(path) && !is_ipa(output) {
         copy_tree(path, output)?;
         let result = prepare(output, &prov, bundle_id);
         if result.is_err() {
@@ -88,10 +105,21 @@ pub fn sign_app(
         }
         return result;
     }
-    let work = std::env::temp_dir().join(format!("rxc-sign-{}", std::process::id()));
+    // one folder per call: a server may sign several apps at once
+    static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let work = std::env::temp_dir().join(format!("rxc-sign-{}-{call}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
-    let result = crate::util::unzip(path, &work)
-        .and_then(|_| find_payload_app(&work))
+    let staged = if is_ipa(path) {
+        crate::util::unzip(path, &work).and_then(|_| find_payload_app(&work))
+    } else {
+        let app = path.canonicalize()?;
+        let app = work
+            .join("Payload")
+            .join(app.file_name().unwrap_or_default());
+        copy_tree(path, &app).map(|_| app)
+    };
+    let result = staged
         .and_then(|app| prepare(&app, &prov, bundle_id))
         .and_then(|bundle| zip_dir(&work, output).map(|_| bundle));
     let _ = std::fs::remove_dir_all(&work);
@@ -159,71 +187,11 @@ fn prepare(app: &Path, prov: &Provision, bundle_id: Option<&str>) -> Result<Stri
     if changed {
         Value::Dictionary(info).to_file_binary(&info_path)?;
     }
-    let entitlements = entitlements_for(prov.profile, prov.signer, &bundle)?;
+    let entitlements =
+        entitlements_for(prov.profile, &prov.signer.cert, &bundle, SystemTime::now())?;
     std::fs::write(app.join("embedded.mobileprovision"), prov.raw)?;
     sign_bundle(app, Some(prov.signer), Some(&entitlements), Some(&prov))?;
     Ok(bundle)
-}
-
-fn parse_profile(raw: &[u8]) -> Result<Dictionary> {
-    // the plist sits inside a CMS envelope; the envelope's signature is Apple's business
-    let find = |h: &[u8], n: &[u8]| h.windows(n.len()).position(|w| w == n);
-    let start = find(raw, b"<?xml");
-    let end = start.and_then(|s| find(&raw[s..], b"</plist>").map(|e| s + e + 8));
-    match (start, end) {
-        (Some(s), Some(e)) => Value::from_reader(std::io::Cursor::new(&raw[s..e]))?
-            .into_dictionary()
-            .ok_or_else(|| Error::msg("provisioning profile is not a dictionary")),
-        _ => bail("not a provisioning profile"),
-    }
-}
-
-/// The profile's entitlements narrowed to this app, the way Xcode writes them: the
-/// application identifier and wildcard keychain groups become `TEAM.bundle`.
-fn entitlements_for(profile: &Dictionary, signer: &Signer, bundle: &str) -> Result<Dictionary> {
-    if let Some(expiry) = profile.get("ExpirationDate").and_then(Value::as_date)
-        && std::time::SystemTime::from(expiry) < std::time::SystemTime::now()
-    {
-        return bail(format!(
-            "the provisioning profile expired on {}",
-            expiry.to_xml_format()
-        ));
-    }
-    let has_cert = profile
-        .get("DeveloperCertificates")
-        .and_then(Value::as_array)
-        .is_some_and(|c| c.iter().any(|c| c.as_data() == Some(&signer.cert[..])));
-    if !has_cert {
-        return bail("the provisioning profile does not include the p12's certificate");
-    }
-    let mut ent = profile
-        .get("Entitlements")
-        .and_then(Value::as_dictionary)
-        .cloned()
-        .ok_or_else(|| Error::msg("the provisioning profile has no entitlements"))?;
-    let app_id = format!("{}.{bundle}", signer.team);
-    let allowed = ent
-        .get("application-identifier")
-        .and_then(Value::as_string)
-        .unwrap_or_default();
-    let covers = match allowed.strip_suffix('*') {
-        Some(prefix) => app_id.starts_with(prefix),
-        None => allowed == app_id,
-    };
-    if !covers {
-        return bail(format!(
-            "the provisioning profile is for {allowed}, which does not cover {app_id}"
-        ));
-    }
-    ent.insert("application-identifier".into(), app_id.clone().into());
-    if let Some(Value::Array(groups)) = ent.get_mut("keychain-access-groups") {
-        for g in groups.iter_mut() {
-            if g.as_string().is_some_and(|g| g.ends_with('*')) {
-                *g = app_id.clone().into();
-            }
-        }
-    }
-    Ok(ent)
 }
 
 /// Signs everything nested in `dir` inside-out, seals its resources, then signs its executable.
@@ -424,20 +392,10 @@ fn sign_thin(d: &[u8], c: &Code) -> Result<Vec<u8>> {
 
     let team = c.signer.map(|s| s.team.as_str());
     let requirements = match c.signer {
-        Some(s) => requirements(c.ident, &s.common_name),
+        Some(s) => rxc_sign::requirements(c.ident, &s.common_name),
         None => blob(0xfade0c01, &0u32.to_be_bytes()),
     };
-    let ents = match c.entitlements {
-        Some(e) => {
-            let mut xml = vec![];
-            Value::Dictionary(e.clone()).to_writer_xml(&mut xml)?;
-            Some((
-                blob(0xfade7171, &xml),
-                blob(0xfade7172, &der_entitlements(e)?),
-            ))
-        }
-        None => None,
-    };
+    let ents = c.entitlements.map(entitlement_blobs).transpose()?;
     let n_special = match (&ents, c.info_plist) {
         (Some(_), _) => 7,
         (None, Some(_)) => 3,
@@ -449,7 +407,7 @@ fn sign_thin(d: &[u8], c: &Code) -> Result<Vec<u8>> {
         + team.map_or(0, |t| t.len() + 1)
         + 32 * (n_special + limit.div_ceil(PAGE));
     let cms_room = c.signer.map_or(8, |s| {
-        s.cert.len() + WWDR_G3.len() + crate::util::APPLE_ROOT_CA.len() + 2048
+        s.cert.len() + rxc_sign::WWDR_G3.len() + rxc_sign::APPLE_ROOT_CA.len() + 2048
     });
     let ents_len = ents.as_ref().map_or(0, |(x, d)| x.len() + d.len());
     let blob_count = if ents.is_some() { 5 } else { 3 };
@@ -552,150 +510,22 @@ fn sign_thin(d: &[u8], c: &Code) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn blob(magic: u32, payload: &[u8]) -> Vec<u8> {
-    [
-        &magic.to_be_bytes()[..],
-        &(8 + payload.len() as u32).to_be_bytes()[..],
-        payload,
-    ]
-    .concat()
-}
-
-/// The designated requirement Xcode writes for Apple Development certificates.
-fn requirements(ident: &str, common_name: &str) -> Vec<u8> {
-    let mut e = vec![];
-    let op = |e: &mut Vec<u8>, v: u32| e.extend(v.to_be_bytes());
-    let data = |e: &mut Vec<u8>, b: &[u8]| {
-        e.extend((b.len() as u32).to_be_bytes());
-        e.extend(b);
-        e.resize(e.len().next_multiple_of(4), 0);
-    };
-    op(&mut e, 6); // and
-    op(&mut e, 2); // identifier
-    data(&mut e, ident.as_bytes());
-    op(&mut e, 6); // and
-    op(&mut e, 15); // anchor apple generic
-    op(&mut e, 6); // and
-    op(&mut e, 11); // certificate field
-    op(&mut e, 0); // leaf
-    data(&mut e, b"subject.CN");
-    op(&mut e, 1); // equals
-    data(&mut e, common_name.as_bytes());
-    op(&mut e, 14); // certificate generic (extension)
-    op(&mut e, 1); // certificate 1
-    data(&mut e, APPLE_DEV_INTERMEDIATE);
-    op(&mut e, 0); // exists
-    let designated = blob(0xfade0c00, &[&1u32.to_be_bytes()[..], &e[..]].concat());
-    // one requirement: designated (3), right after the 20-byte set header
-    let header = [1u32, 3, 20].map(u32::to_be_bytes).concat();
-    blob(0xfade0c01, &[header, designated].concat())
-}
-
-/// Entitlements in Apple's DER form: [APPLICATION 16] { 1, [16] { {key, value}... } }.
-fn der_entitlements(e: &Dictionary) -> Result<Vec<u8>> {
-    fn value(v: &Value) -> Result<Vec<u8>> {
-        Ok(match v {
-            Value::Boolean(b) => vec![0x01, 0x01, if *b { 0xff } else { 0 }],
-            Value::String(s) => der::utf8(s),
-            Value::Integer(i) => der::int(
-                i.as_signed()
-                    .ok_or_else(|| Error::msg("entitlements: integer out of range"))?,
-            ),
-            Value::Array(a) => der::tlv(
-                0x30,
-                &a.iter().map(value).collect::<Result<Vec<_>>>()?.concat(),
-            ),
-            Value::Dictionary(d) => {
-                let mut pairs: Vec<_> = d.iter().collect();
-                pairs.sort_by_key(|p| p.0);
-                let pairs = pairs
-                    .into_iter()
-                    .map(|(k, v)| Ok(der::seq(&[&der::utf8(k), &value(v)?])))
-                    .collect::<Result<Vec<_>>>()?;
-                der::tlv(0xb0, &pairs.concat())
-            }
-            _ => {
-                return bail(
-                    "entitlements: only booleans, strings, integers, arrays and dictionaries are supported",
-                );
-            }
-        })
-    }
-    Ok(der::tlv(
-        0x70,
-        &[der::int(1), value(&Value::Dictionary(e.clone()))?].concat(),
-    ))
-}
-
 /// Detached CMS SignedData over the code directory, as Xcode makes it.
 fn cms(s: &Signer, cd: &[u8]) -> Result<Vec<u8>> {
-    let cdhash = digest(&SHA256, cd);
-    let mut cdhashes = vec![];
-    Value::Dictionary(Dictionary::from_iter([(
-        "cdhashes".to_string(),
-        Value::Array(vec![Value::Data(cdhash.as_ref()[..20].to_vec())]),
-    )]))
-    .to_writer_xml(&mut cdhashes)?;
-    let attr = |o: &[u8], v: &[u8]| der::seq(&[&der::oid(o), &der::set(&[v])]);
-    let mut attrs = [
-        attr(oid::CONTENT_TYPE, &der::oid(oid::DATA)),
-        attr(oid::SIGNING_TIME, &der::tlv(0x17, utc_time().as_bytes())),
-        attr(oid::MESSAGE_DIGEST, &der::octets(cdhash.as_ref())),
-        attr(
-            oid::APPLE_CDHASHES2,
-            &der::seq(&[&der::oid(oid::SHA256), &der::octets(cdhash.as_ref())]),
-        ),
-        attr(oid::APPLE_CDHASHES, &der::octets(&cdhashes)),
-    ];
-    attrs.sort(); // DER orders SET OF by encoding
-    let attrs = attrs.concat();
-    let mut sig = vec![0; s.key.public().modulus_len()];
-    s.key
-        .sign(
-            &ring::signature::RSA_PKCS1_SHA256,
-            &ring::rand::SystemRandom::new(),
-            &der::tlv(0x31, &attrs),
-            &mut sig,
-        )
-        .map_err(|_| Error::msg("RSA signing failed"))?;
-    let cert = p12::parse_cert(&s.cert)?;
-    let signer_info = der::seq(&[
-        &der::int(1),
-        &der::seq(&[cert.issuer, cert.serial]),
-        &der::alg(oid::SHA256),
-        &der::tlv(0xa0, &attrs),
-        &der::alg(oid::SHA256_RSA),
-        &der::octets(&sig),
-    ]);
-    // shortcut: always chains through WWDR G3, which issues Apple Development certificates
-    // today; read the issuer from the p12 if Apple moves them to another intermediate
-    let certs = [&s.cert[..], WWDR_G3, crate::util::APPLE_ROOT_CA].concat();
-    let signed = der::seq(&[
-        &der::int(1),
-        &der::set(&[&der::alg(oid::SHA256)]),
-        &der::seq(&[&der::oid(oid::DATA)]),
-        &der::tlv(0xa0, &certs),
-        &der::set(&[&signer_info]),
-    ]);
-    Ok(der::seq(&[
-        &der::oid(oid::SIGNED_DATA),
-        &der::tlv(0xa0, &signed),
-    ]))
-}
-
-/// Now as ASN.1 UTCTime, YYMMDDhhmmssZ.
-fn utc_time() -> String {
-    let t = crate::util::timestamp();
-    [
-        &t[2..4],
-        &t[5..7],
-        &t[8..10],
-        &t[11..13],
-        &t[14..16],
-        &t[17..19],
-        "Z",
-    ]
-    .concat()
+    let key = match &s.key {
+        Key::Remote(cms) => return cms(cd),
+        Key::Local(key) => key,
+    };
+    let attrs = rxc_sign::cms_attrs(cd, SystemTime::now())?;
+    let mut sig = vec![0; key.public().modulus_len()];
+    key.sign(
+        &ring::signature::RSA_PKCS1_SHA256,
+        &ring::rand::SystemRandom::new(),
+        &attrs,
+        &mut sig,
+    )
+    .map_err(|_| Error::msg("RSA signing failed"))?;
+    Ok(rxc_sign::signed_data(&s.cert, &attrs, &sig)?)
 }
 
 /// `_CodeSignature/CodeResources` with Xcode's iOS rules: every file but the executable, SHA-1
@@ -888,7 +718,8 @@ fn le64(d: &[u8], at: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::der::Der;
+    use rxc_sign::der::{self, Der, oid};
+    use rxc_sign::{APPLE_ROOT_CA, WWDR_G3, der_entitlements};
     use std::fs;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sign");
@@ -1056,7 +887,7 @@ mod tests {
         let mut certs = Der(sd.expect(0xa0).unwrap());
         let leaf = certs.raw().unwrap();
         assert_eq!(certs.raw().unwrap(), WWDR_G3);
-        assert_eq!(certs.raw().unwrap(), crate::util::APPLE_ROOT_CA);
+        assert_eq!(certs.raw().unwrap(), APPLE_ROOT_CA);
         let mut si = Der(Der(sd.expect(0x31).unwrap()).expect(0x30).unwrap());
         si.uint().unwrap();
         si.next().unwrap();
@@ -1066,7 +897,7 @@ mod tests {
         let sig = si.octets().unwrap();
         ring::signature::UnparsedPublicKey::new(
             &ring::signature::RSA_PKCS1_2048_8192_SHA256,
-            p12::parse_cert(leaf).unwrap().public_key,
+            rxc_sign::parse_cert(leaf).unwrap().public_key,
         )
         .verify(&der::tlv(0x31, attrs), &sig)
         .unwrap();
@@ -1259,6 +1090,11 @@ mod tests {
         crate::util::unzip(&signed_ipa, &unpacked).unwrap();
         let exe = unpacked.join("Payload/T.app/T");
         check(&exe, &[]);
+        // .app in, .ipa out
+        let app_ipa = root.join("A.ipa");
+        sign_app(&app, &app_ipa, &s, &prof, None).unwrap();
+        crate::util::unzip(&app_ipa, &root.join("unpacked-app")).unwrap();
+        check(&root.join("unpacked-app/Payload/T.app/T"), &[]);
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
             fs::metadata(&exe).unwrap().permissions().mode() & 0o111,
@@ -1279,6 +1115,59 @@ mod tests {
         assert!(err(&profile("TESTTEAM01.*", 3600, b"other"), None).contains("certificate"));
         assert!(!root.join("X.app").exists());
         assert!(sign_app(&app, &app, &s, &prof, None).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn signs_through_the_key_holder() {
+        let root = temp("remote");
+        let app = bundle(&root);
+        let cert = fs::read(format!("{FIXTURES}/cert.der")).unwrap();
+        let prof = profile("TESTTEAM01.*", 3600, &cert);
+        let key = p12::load(
+            &fs::read(format!("{FIXTURES}/pbes2-aes256.p12")).unwrap(),
+            "test",
+        )
+        .unwrap()
+        .key;
+        let cds = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let (seen, held) = (cds.clone(), prof.clone());
+        // what the key holder does, with the RSA step in between
+        let remote = Signer::remote(&prof, move |cd| {
+            seen.lock().unwrap().push(cd.to_vec());
+            let attrs = rxc_sign::signed_attrs(&held, cd, SystemTime::now())?;
+            let mut sig = vec![0; key.public().modulus_len()];
+            let rng = ring::rand::SystemRandom::new();
+            key.sign(&ring::signature::RSA_PKCS1_SHA256, &rng, &attrs, &mut sig)
+                .unwrap();
+            Ok(rxc_sign::cms(&held, &attrs, &sig)?)
+        })
+        .unwrap();
+        let out = root.join("Out.app");
+        sign_app(&app, &out, &remote, &prof, None).unwrap();
+        for exe in ["T", "PlugIns/P.xctest/P", "Frameworks/libhello.dylib"] {
+            check(&out.join(exe), &[]).iter().for_each(check_cms);
+        }
+
+        let cd = cds.lock().unwrap()[..]
+            .iter()
+            .find(|cd| be32(cd, 24).unwrap() == 7)
+            .unwrap()
+            .clone();
+        assert!(rxc_sign::signed_attrs(&prof, &cd, SystemTime::now()).is_ok());
+        let refused = |change: &dyn Fn(&mut Vec<u8>)| {
+            let mut cd = cd.clone();
+            change(&mut cd);
+            rxc_sign::signed_attrs(&prof, &cd, SystemTime::now())
+                .unwrap_err()
+                .0
+        };
+        let team = cd.windows(10).position(|w| w == b"TESTTEAM01").unwrap();
+        let ent_slot = be32(&cd, 16).unwrap() as usize - 32 * 5;
+        assert!(refused(&|cd| *cd = b"bytes to sign".to_vec()).contains("not a code directory"));
+        assert!(refused(&|cd| cd[team] = b'X').contains("not for team TESTTEAM01"));
+        assert!(refused(&|cd| cd[ent_slot] ^= 1).contains("entitlements other than"));
+        assert!(refused(&|cd| cd[15] = 2).contains("ad-hoc"));
         fs::remove_dir_all(&root).unwrap();
     }
 

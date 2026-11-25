@@ -387,6 +387,7 @@ fn open_link(dev: &mut Device) -> Result<(Link, TunnelParams, String)> {
     let udid = dev.udid().to_string();
     crate::info!("connecting tunnel", "device" => udid);
     let mut stream = dev.connect_service(CORE_DEVICE_PROXY)?;
+    stream.set_read_timeout(Some(crate::usbmux::REPLY_TIMEOUT))?;
     stream.write_all(&cdtunnel_request(REQUESTED_MTU))?;
     stream.flush()?;
     let params = parse_cdtunnel_response(&mut stream)?;
