@@ -875,6 +875,92 @@ pub fn simulate_location(t: &Tunnel, at: Option<(f64, f64)>) -> Result<()> {
     .map(|_| ())
 }
 
+/// `devicectl device pasteboard copy`: `text` as the general pasteboard's one item, under the
+/// text types devicectl writes; no text leaves the pasteboard empty.
+pub fn pasteboard_copy(t: &Tunnel, text: &[u8]) -> Result<()> {
+    // shortcut: one SET, three copies of the text, kept under HTTP/2's 64 KB send window that
+    // XpcConn never sees grow; send in parts when longer text is needed
+    if text.len() > 16384 {
+        return bail("pasteboard copy takes up to 16 KB of text");
+    }
+    let s = t.connect_service("com.apple.coredevice.pasteboardservice")?;
+    // the device would ask back (RESOLVE) for data that is not inline, and wait
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut c = XpcConn::connect(s)?;
+    c.send(pasteboard_set(text), xpc::HEARTBEAT_REQUEST)?;
+    let m = c.recv_body(xpc::SERVER_CLIENT)?;
+    match m.get("command").and_then(X::as_str) {
+        Some("SET_REPLY") => Ok(()),
+        _ => bail(format!("pasteboard: unexpected reply {m:?}")),
+    }
+}
+
+fn pasteboard_set(text: &[u8]) -> X {
+    let types = ["public.utf8-plain-text", "public.plain-text", "public.text"];
+    let data = xdict(vec![("data", X::Data(text.to_vec()))]);
+    let item = xdict(vec![
+        ("types", X::Array(types.map(X::from).to_vec())),
+        (
+            "data",
+            xdict(types.iter().map(|&t| (t, data.clone())).collect()),
+        ),
+    ]);
+    let items = if text.is_empty() { vec![] } else { vec![item] };
+    xdict(vec![
+        ("command", "SET".into()),
+        ("pasteboardName", "general".into()),
+        ("items", X::Array(items)),
+    ])
+}
+
+/// `devicectl device settings appearance --mode`: "light" or "dark".
+pub fn set_appearance(t: &Tunnel, mode: &str) -> Result<()> {
+    let s = t.connect_service("com.apple.coredevice.configuration")?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    coredevice_call(
+        &mut XpcConn::connect(s)?,
+        "com.apple.coredevice.feature.customizeuistyle",
+        Some("com.apple.coredevice.action.setuserinterfacestyle"),
+        xdict(vec![("style", mode.into())]),
+    )
+    .map(|_| ())
+}
+
+/// `devicectl device orientation set`: one of [`ORIENTATIONS`]; the orientation the device then
+/// reports.
+pub fn set_orientation(t: &Tunnel, orientation: &str) -> Result<String> {
+    let s = t.connect_service("com.apple.coredevice.devicecontrol")?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut c = XpcConn::connect(s)?;
+    let change = xdict(vec![("_0", orientation.into())]);
+    c.send(
+        xdict(vec![
+            (
+                "featureIdentifier",
+                "com.apple.coredevice.feature.remote.devicecontrol.orientation".into(),
+            ),
+            ("messageType", "Request".into()),
+            ("payload", xdict(vec![("changeOrientation", change)])),
+        ]),
+        xpc::HEARTBEAT_REQUEST,
+    )?;
+    let m = c.recv_body(xpc::SERVER_CLIENT)?;
+    match m.get("currentDeviceOrientation").and_then(X::as_str) {
+        Some(now) => Ok(now.into()),
+        None => bail(format!("orientation: unexpected reply {m:?}")),
+    }
+}
+
+/// devicectl's orientations, each with its short form.
+pub const ORIENTATIONS: [(&str, &str); 6] = [
+    ("portrait", "p"),
+    ("portraitUpsideDown", "pu"),
+    ("landscapeLeft", "ll"),
+    ("landscapeRight", "lr"),
+    ("faceUp", "fu"),
+    ("faceDown", "fd"),
+];
+
 pub fn signal_process(t: &Tunnel, pid: i64, signal: i64) -> Result<()> {
     let input = xdict(vec![
         ("process", xdict(vec![("processIdentifier", X::I64(pid))])),
@@ -896,6 +982,21 @@ mod tests {
 
     fn fixture(n: &str) -> Vec<u8> {
         std::fs::read(format!("tests/fixtures/xctestrun/{n}")).unwrap()
+    }
+
+    #[test]
+    fn pasteboard_text_goes_inline_and_none_clears() {
+        let Some(X::Array(items)) = pasteboard_set(b"hi").get("items").cloned() else {
+            panic!("no items")
+        };
+        let text = |t| items[0].get("data")?.get(t)?.get("data").cloned();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            text("public.utf8-plain-text"),
+            Some(X::Data(b"hi".to_vec()))
+        );
+        assert_eq!(text("public.text"), Some(X::Data(b"hi".to_vec())));
+        assert_eq!(pasteboard_set(b"").get("items"), Some(&X::Array(vec![])));
     }
 
     fn m(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

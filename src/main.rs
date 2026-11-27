@@ -63,6 +63,15 @@ const COMMANDS: &[(&str, &str)] = &[
         "devicectl device simulate location clear",
         "--device <udid>",
     ),
+    ("devicectl device pasteboard copy", "--device <udid> < text"),
+    (
+        "devicectl device orientation set",
+        "--device <udid> <orientation>",
+    ),
+    (
+        "devicectl device settings appearance",
+        "--device <udid> --mode <light|dark>",
+    ),
     ("devicectl manage ddis update", "--source-dir <dir>"),
     (
         "xcodebuild test-without-building",
@@ -77,7 +86,12 @@ const COMMANDS: &[(&str, &str)] = &[
          [--output <path>] [--bundle-id <id>] [--install]",
     ),
     ("profile list", "--device <udid>"),
+    ("profile remove", "--device <udid> <identifier>"),
     ("profile cloud-configuration", "--device <udid>"),
+    (
+        "log collect",
+        "--device <udid> --output <path.logarchive> [--last <n>m|h|d]",
+    ),
     (
         "lockdown get",
         "--device <udid> [--domain <domain>] [<key>]",
@@ -118,6 +132,8 @@ const VALUE_OPTS: &[&str] = &[
     "--latitude",
     "--longitude",
     "--type",
+    "--mode",
+    "--last",
 ];
 
 /// Human-readable output goes to stderr when the JSON document takes stdout.
@@ -452,6 +468,46 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
             say("Location simulation cleared.");
             json!({"deviceIdentifier": t.udid})
         }
+        "devicectl device pasteboard copy" => {
+            let mut text = vec![];
+            // one byte over the limit, for pasteboard_copy to refuse
+            std::io::Read::read_to_end(
+                &mut std::io::Read::take(std::io::stdin(), 16385),
+                &mut text,
+            )?;
+            let t = open_tunnel(a)?;
+            xctest::pasteboard_copy(&t, &text)?;
+            say(match text.is_empty() {
+                true => "Cleared the pasteboard.".to_string(),
+                false => format!("Copied {} bytes to the pasteboard.", text.len()),
+            });
+            json!({"deviceIdentifier": t.udid})
+        }
+        "devicectl device orientation set" => {
+            let o = arg("orientation")?;
+            let Some(&(o, _)) = xctest::ORIENTATIONS
+                .iter()
+                .find(|(n, s)| o == *n || o == *s)
+            else {
+                let names: Vec<_> = xctest::ORIENTATIONS.iter().map(|(n, _)| *n).collect();
+                return bail(format!("<orientation> is one of {}", names.join(", ")));
+            };
+            let t = open_tunnel(a)?;
+            let now = xctest::set_orientation(&t, o)?;
+            say(format!("Orientation is now {now}."));
+            json!({"deviceIdentifier": t.udid, "orientation": now})
+        }
+        "devicectl device settings appearance" => {
+            let mode = match a.opt("--mode") {
+                Some("light" | "l") => "light",
+                Some("dark" | "d") => "dark",
+                _ => return bail("--mode takes light or dark"),
+            };
+            let t = open_tunnel(a)?;
+            xctest::set_appearance(&t, mode)?;
+            say(format!("Appearance set to {mode}."));
+            json!({"deviceIdentifier": t.udid, "mode": mode})
+        }
         "devicectl device capture screenshot" => {
             let dest = a
                 .opt("--destination")
@@ -505,7 +561,8 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
         "profile list" => {
             let mut d = Device::open(a.udid(), true, 1)?;
             let mut s = d.connect_service(services::MC_INSTALL)?;
-            let profiles = services::profiles(&services::mc_install(&mut s, "GetProfileList")?);
+            let profiles =
+                services::profiles(&services::mc_install(&mut s, "GetProfileList", &[])?);
             for p in &profiles {
                 let name = p.get("PayloadDisplayName").and_then(|v| v.as_string());
                 let active = p.get("IsActive").and_then(|v| v.as_boolean()) == Some(true);
@@ -525,10 +582,17 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
                 .collect();
             json!({"deviceIdentifier": d.udid(), "profiles": profiles})
         }
+        "profile remove" => {
+            let id = arg("identifier")?;
+            let mut d = Device::open(a.udid(), true, 1)?;
+            services::remove_profile(&mut d.connect_service(services::MC_INSTALL)?, id)?;
+            say(format!("Removed profile {id}."));
+            json!({"deviceIdentifier": d.udid(), "identifier": id})
+        }
         "profile cloud-configuration" => {
             let mut d = Device::open(a.udid(), true, 1)?;
             let mut s = d.connect_service(services::MC_INSTALL)?;
-            let r = services::mc_install(&mut s, "GetCloudConfiguration")?;
+            let r = services::mc_install(&mut s, "GetCloudConfiguration", &[])?;
             let config = r
                 .get("CloudConfiguration")
                 .map(plist_json)
@@ -544,6 +608,31 @@ fn run(command: &str, rest: &[String], a: &Args) -> Result<J> {
                 },
             );
             json!({"deviceIdentifier": d.udid(), "cloudConfiguration": config})
+        }
+        "log collect" => {
+            let out = a
+                .opt("--output")
+                .ok_or_else(|| Error::msg("--output <path.logarchive> is required"))?;
+            let start = match a.opt("--last") {
+                Some(l) => {
+                    let n = |unit: &str, secs: u64| {
+                        l.strip_suffix(unit)
+                            .and_then(|n| n.parse::<u64>().ok())
+                            .and_then(|n| n.checked_mul(secs))
+                    };
+                    let Some(secs) = n("m", 60).or(n("h", 3600)).or(n("d", 86400)) else {
+                        return bail("--last takes <n>m, <n>h or <n>d");
+                    };
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+                    Some(now.unwrap_or_default().as_secs().saturating_sub(secs))
+                }
+                None => None,
+            };
+            let mut d = Device::open(a.udid(), true, 1)?;
+            let mut s = d.connect_service(services::OS_TRACE_RELAY)?;
+            services::log_collect(&mut s, start, Path::new(out))?;
+            say(format!("Wrote the log archive to {out}."));
+            json!({"deviceIdentifier": d.udid(), "output": out})
         }
         "lockdown get" => {
             let (domain, key) = (a.opt("--domain"), rest.first().map(|s| s.as_str()));
@@ -1038,6 +1127,7 @@ mod tests {
             "tunnel",
             "sign",
             "profile",
+            "log",
             "lockdown",
         ];
         for (c, _) in super::COMMANDS {
