@@ -299,8 +299,8 @@ mod tests {
             unsafe { std::env::set_var("USBMUXD_SOCKET_ADDRESS", input) };
             assert_eq!(socket_address(), want, "input {input:?}");
         }
-        set_socket_address("/tmp/farm");
-        assert_eq!(socket_address(), "unix:///tmp/farm");
+        set_socket_address("/tmp/usbmuxd-2");
+        assert_eq!(socket_address(), "unix:///tmp/usbmuxd-2");
         // usbmuxd's replies are waited for only so long
         let path = std::env::temp_dir().join(format!("rxc-usbmuxd-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);

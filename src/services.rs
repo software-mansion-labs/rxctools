@@ -5,13 +5,14 @@ use crate::lockdown::{dict, read_plist, write_plist};
 use crate::util::{Error, Result, bail};
 use plist::Dictionary;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const INSTALLATION_PROXY: &str = "com.apple.mobile.installation_proxy";
 pub const ZIP_CONDUIT: &str = "com.apple.streaming_zip_conduit";
 pub const AMFI: &str = "com.apple.amfi.lockdown";
 pub const DIAGNOSTICS: &str = "com.apple.mobile.diagnostics_relay";
 pub const MC_INSTALL: &str = "com.apple.mobile.MCInstall";
+pub const OS_TRACE_RELAY: &str = "com.apple.os_trace_relay";
 
 /// AMFI developer mode actions: 0 reveals the toggle in Settings, 1 turns developer mode on (the
 /// device restarts; refused while a passcode is set), 2 confirms it after the restart.
@@ -48,8 +49,14 @@ pub fn restart(s: &mut (impl Read + Write)) -> Result<()> {
 }
 
 /// One MCInstall request, such as GetProfileList or GetCloudConfiguration; its reply.
-pub fn mc_install(s: &mut (impl Read + Write), request: &str) -> Result<Dictionary> {
-    write_plist(s, &dict(&[("RequestType", request.into())]))?;
+pub fn mc_install(
+    s: &mut (impl Read + Write),
+    request: &str,
+    args: &[(&str, plist::Value)],
+) -> Result<Dictionary> {
+    let mut req = dict(args);
+    req.insert("RequestType".into(), request.into());
+    write_plist(s, &req)?;
     let r = read_plist(s)?;
     match r.get("Status").and_then(|v| v.as_string()) {
         Some("Acknowledged") => Ok(r),
@@ -80,6 +87,134 @@ pub fn profiles(reply: &Dictionary) -> Vec<Dictionary> {
             p
         })
         .collect()
+}
+
+/// RemoveProfile for a profile GetProfileList lists. The device acknowledges a profile it does not
+/// have too, so the list is read before and after. A profile with PayloadRemovalDisallowed, as the
+/// enrollment profile of device management has, is refused.
+pub fn remove_profile(s: &mut (impl Read + Write), id: &str) -> Result<()> {
+    let listed = |s: &mut _| -> Result<Option<Dictionary>> {
+        let list = profiles(&mc_install(s, "GetProfileList", &[])?);
+        Ok(list
+            .into_iter()
+            .find(|p| p["identifier"].as_string() == Some(id)))
+    };
+    let Some(p) = listed(&mut *s)? else {
+        return bail(format!(
+            "no profile {id} in `rxc profile list`, which leaves out what device management installed"
+        ));
+    };
+    if p.get("PayloadRemovalDisallowed")
+        .and_then(|v| v.as_boolean())
+        == Some(true)
+    {
+        return bail(format!(
+            "{id} does not allow removal (PayloadRemovalDisallowed)"
+        ));
+    }
+    let mut key = dict(&[
+        ("PayloadType", "Configuration".into()),
+        ("PayloadIdentifier", id.into()),
+    ]);
+    for k in ["PayloadUUID", "PayloadVersion"] {
+        if let Some(v) = p.get(k) {
+            key.insert(k.into(), v.clone());
+        }
+    }
+    let mut key_plist = vec![];
+    plist::Value::from(key).to_writer_xml(&mut key_plist)?;
+    mc_install(
+        &mut *s,
+        "RemoveProfile",
+        &[("ProfileIdentifier", plist::Value::Data(key_plist))],
+    )?;
+    match listed(s)? {
+        Some(_) => bail(format!("the device kept profile {id}")),
+        None => Ok(()),
+    }
+}
+
+/// os_trace_relay CreateArchive: the unified log since `start` (unix seconds; all of it with None),
+/// unpacked into the new folder `dir`, a .logarchive that `log show` reads. Its Info.plist comes last,
+/// after the shared cache symbols (dsc/, most of the archive), so the whole stream is read.
+pub fn log_collect(s: &mut (impl Read + Write), start: Option<u64>, dir: &Path) -> Result<()> {
+    std::fs::create_dir(dir).map_err(|e| Error::msg(format!("{}: {e}", dir.display())))?;
+    let mut req = dict(&[("Request", "CreateArchive".into())]);
+    if let Some(t) = start {
+        req.insert("StartTime".into(), t.into());
+    }
+    write_plist(s, &req)?;
+    let mut one = [0u8];
+    s.read_exact(&mut one)?;
+    let r = read_plist(s)?;
+    if one[0] != 1 || r.get("Status").and_then(|v| v.as_string()) != Some("RequestSuccessful") {
+        return bail(format!("CreateArchive was refused: {r:?}"));
+    }
+    untar(&mut Frames { s, left: 0 }, dir)
+}
+
+/// The archive as os_trace_relay sends it: frames of [3][u32 LE length][bytes].
+struct Frames<'a, S> {
+    s: &'a mut S,
+    left: usize,
+}
+
+impl<S: Read> Read for Frames<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.left == 0 {
+            let mut h = [0u8; 5];
+            self.s.read_exact(&mut h)?;
+            if h[0] != 3 {
+                return Err(std::io::Error::other(format!(
+                    "log archive frame of type {}",
+                    h[0]
+                )));
+            }
+            self.left = u32::from_le_bytes([h[1], h[2], h[3], h[4]]) as usize;
+        }
+        let max = buf.len().min(self.left);
+        let n = self.s.read(&mut buf[..max])?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.left -= n;
+        Ok(n)
+    }
+}
+
+/// The files and folders of a tar stream into `dir`, other entries skipped.
+fn untar(r: &mut impl Read, dir: &Path) -> Result<()> {
+    let mut h = [0u8; 512];
+    loop {
+        r.read_exact(&mut h)?;
+        if h == [0; 512] {
+            return Ok(());
+        }
+        let text =
+            |f: &[u8]| String::from_utf8_lossy(f.split(|&b| b == 0).next().unwrap()).into_owned();
+        // shortcut: no pax or GNU long names; every name in a log archive fits the 100 bytes
+        let name = text(&h[..100]);
+        let path = Path::new(name.trim_start_matches("./"));
+        let size = u64::from_str_radix(text(&h[124..136]).trim(), 8)
+            .map_err(|_| Error::msg(format!("tar: no size for {name}")))?;
+        if path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            return bail(format!("tar: {name} points outside the archive"));
+        }
+        let mut data = r.by_ref().take(size);
+        match h[156] {
+            b'0' | 0 => {
+                std::fs::create_dir_all(dir.join(path.parent().unwrap_or(path)))?;
+                std::io::copy(&mut data, &mut std::fs::File::create(dir.join(path))?)?;
+            }
+            b'5' => std::fs::create_dir_all(dir.join(path))?,
+            _ => {}
+        }
+        let rest = data.limit() + (512 - size % 512) % 512;
+        std::io::copy(&mut r.by_ref().take(rest), &mut std::io::sink())?;
+    }
 }
 
 pub fn browse_request(app_type: &str, show_launch_prohibited: bool) -> Dictionary {
@@ -437,6 +572,135 @@ mod tests {
         ]);
         assert_eq!(profiles(&reply), [want]);
         assert!(profiles(&Dictionary::new()).is_empty());
+    }
+
+    struct Duplex<'a>(&'a [u8], Vec<u8>);
+    impl Read for Duplex<'_> {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(b)
+        }
+    }
+    impl Write for Duplex<'_> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.1.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn removes_only_a_listed_profile() {
+        let list = |ids: &[(&str, bool)]| {
+            let order: Vec<plist::Value> = ids.iter().map(|&(id, _)| id.into()).collect();
+            let meta: Vec<_> = ids
+                .iter()
+                .map(|&(id, locked)| {
+                    let m = [
+                        ("PayloadRemovalDisallowed", locked.into()),
+                        ("PayloadUUID", "U".into()),
+                    ];
+                    (id, dict(&m).into())
+                })
+                .collect();
+            frame(&dict(&[
+                ("Status", "Acknowledged".into()),
+                ("OrderedIdentifiers", order.into()),
+                ("ProfileMetadata", dict(&meta).into()),
+            ]))
+        };
+        let ack = frame(&dict(&[("Status", "Acknowledged".into())]));
+        let input = [
+            list(&[("mdm", true), ("ca", false)]),
+            ack.clone(),
+            list(&[("mdm", true)]),
+        ]
+        .concat();
+        let mut s = Duplex(&input, vec![]);
+        remove_profile(&mut s, "ca").unwrap();
+        let mut sent = &s.1[..];
+        let _list = read_plist(&mut sent).unwrap();
+        let remove = read_plist(&mut sent).unwrap();
+        assert_eq!(remove["RequestType"].as_string(), Some("RemoveProfile"));
+        let key: Dictionary =
+            plist::from_bytes(remove["ProfileIdentifier"].as_data().unwrap()).unwrap();
+        assert_eq!(key["PayloadIdentifier"].as_string(), Some("ca"));
+        assert_eq!(key["PayloadUUID"].as_string(), Some("U"));
+
+        let input = list(&[("mdm", true)]);
+        for (id, why) in [("mdm", "does not allow removal"), ("x", "no profile")] {
+            let mut s = Duplex(&input, vec![]);
+            let e = remove_profile(&mut s, id).unwrap_err();
+            assert!(e.to_string().contains(why), "{e}");
+            // only the list was asked for
+            assert_eq!(
+                s.1,
+                frame(&dict(&[("RequestType", "GetProfileList".into())]))
+            );
+        }
+        let input = [list(&[("ca", false)]), ack, list(&[("ca", false)])].concat();
+        let kept = remove_profile(&mut Duplex(&input, vec![]), "ca").unwrap_err();
+        assert!(kept.to_string().contains("kept"));
+    }
+
+    #[test]
+    fn log_archive_unpacks() {
+        let entry = |name: &str, kind: u8, data: &[u8]| {
+            let mut h = [0u8; 512];
+            h[..name.len()].copy_from_slice(name.as_bytes());
+            h[124..135].copy_from_slice(format!("{:011o}", data.len()).as_bytes());
+            h[156] = kind;
+            let mut v = [&h[..], data].concat();
+            v.resize(v.len().div_ceil(512) * 512, 0);
+            v
+        };
+        let reply = |entries: &[Vec<u8>]| {
+            let tar = [entries.concat(), vec![0; 1024]].concat();
+            let mut v = [
+                vec![1],
+                frame(&dict(&[("Status", "RequestSuccessful".into())])),
+            ]
+            .concat();
+            // split in two frames, the second starting inside the first file
+            for part in [&tar[..700], &tar[700..]] {
+                v.push(3);
+                v.extend((part.len() as u32).to_le_bytes());
+                v.extend(part);
+            }
+            v
+        };
+        let files = [
+            entry("./", b'5', b""),
+            entry("./Persist/", b'5', b""),
+            entry("./Persist/a.tracev3", b'0', &[7; 600]),
+            entry("./dsc/ABC", b'0', b"symbols"),
+            entry("./Info.plist", b'0', b"x"),
+        ];
+        let dir = std::env::temp_dir().join(format!("rxc-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut s = Duplex(&reply(&files), vec![]);
+        log_collect(&mut s, Some(1700000000), &dir).unwrap();
+        let sent: Dictionary = plist::from_bytes(&s.1[4..]).unwrap();
+        assert_eq!(
+            sent,
+            dict(&[
+                ("Request", "CreateArchive".into()),
+                ("StartTime", 1700000000u64.into())
+            ])
+        );
+        assert_eq!(std::fs::read(dir.join("Info.plist")).unwrap(), b"x");
+        assert_eq!(
+            std::fs::read(dir.join("Persist/a.tracev3")).unwrap(),
+            [7; 600]
+        );
+        assert_eq!(std::fs::read(dir.join("dsc/ABC")).unwrap(), b"symbols");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        let evil = reply(&[entry("../x", b'0', b"x")]);
+        let e = log_collect(&mut Duplex(&evil, vec![]), None, &dir).unwrap_err();
+        assert!(e.to_string().contains("outside"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -23,7 +23,8 @@ use std::time::Duration;
 pub const CORE_DEVICE_PROXY: &str = "com.apple.internal.devicecompute.CoreDeviceProxy";
 /// Where `manage tunnel` serves its tunnel list, and where other commands look for it.
 pub const DEFAULT_API: &str = "127.0.0.1:50550";
-const REQUESTED_MTU: u32 = 16000;
+// with 16000 our packets above about 8 KB got lost (iOS 27, usbmuxd over TCP; USB not tried)
+const REQUESTED_MTU: u32 = 8000;
 
 pub fn api_addr(arg: Option<&str>) -> &str {
     arg.unwrap_or(DEFAULT_API)

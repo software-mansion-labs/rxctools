@@ -384,7 +384,10 @@ impl<S: Read + Write> XpcConn<S> {
             self.opened[i] = true;
             h2_frame(&mut self.out, H2_HEADERS, 0x4, stream, &[]);
         }
-        h2_frame(&mut self.out, H2_DATA, 0, stream, &encode_message(m));
+        // HTTP/2's default largest frame; the device answers a bigger one with GOAWAY
+        for p in encode_message(m).chunks(16384) {
+            h2_frame(&mut self.out, H2_DATA, 0, stream, p);
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -562,6 +565,33 @@ pub fn coredevice_request(device_id: &str, feature: &str, action: Option<&str>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn big_messages_go_out_in_16k_frames() {
+        let mut c = XpcConn {
+            s: std::io::Cursor::new(vec![]),
+            bufs: [vec![], vec![]],
+            opened: [true; 2],
+            out: vec![],
+        };
+        let body = Some(X::Data(vec![0; 40000]));
+        c.queue(
+            CLIENT_SERVER,
+            &Message {
+                flags: ALWAYS_SET,
+                body,
+                id: 1,
+            },
+        );
+        let (mut out, mut sizes) = (&c.out[..], vec![]);
+        while !out.is_empty() {
+            let len = u32::from_be_bytes([0, out[0], out[1], out[2]]) as usize;
+            sizes.push(len);
+            out = &out[9 + len..];
+        }
+        assert_eq!(sizes.len(), 3);
+        assert!(sizes.iter().all(|&l| l <= 16384));
+    }
 
     const UUID: [u8; 16] = [
         0x45, 0x88, 0xd2, 0xdb, 0x23, 0x40, 0x6c, 0x41, 0xbe, 0x63, 0x45, 0x96, 0xc6, 0xae, 0x7f,

@@ -555,7 +555,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rxc-sign"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "plist",
  "sha2",
@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "rxctools"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes",
  "cbc",
